@@ -1,6 +1,6 @@
 # 基于nginx的简单webserver框架
 
-[ TOC ]
+[TOC]
 
 
 
