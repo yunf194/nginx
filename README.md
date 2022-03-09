@@ -1,16 +1,34 @@
-master进程创建监听端口并且初始化
+---
+title: nginx整体框架解析
+date: 2022/3/1
+updated: 
+tags:
+  - nginx
+categories:
+  - webserver
+cover: /images/cover/nginx.jpg
+
+---
+
+
+
+
+
+## master进程创建监听端口并且初始化
+
 1.对于创建的每个要监听的端口都要创建1个socket，ipv4，任意地址，所有网卡设定。
 
-2.setsockopt(isock,SOL_SOCKET, SO_REUSEADDR,(const void *) &reuseaddr, sizeof(reuseaddr))允许重用本地地址,主要是解决TIME_WAIT这个状态导致bind()失败的问题
+2.`setsockopt(isock,SOL_SOCKET, SO_REUSEADDR,(const void *) &reuseaddr, sizeof(reuseaddr))`允许重用本地地址,主要是解决TIME_WAIT这个状态导致bind()失败的问题
 
-3.setnonblocking(isock)设置isock为非阻塞，这样在后续accept的时候就不再会去阻塞住了，
+3.`setnonblocking(isock)`设置isock为非阻塞，这样在后续accept的时候就不再会去阻塞住了，
 
 4.对isock进行bind(),listen()
 
-5.将各个监听的isock（目前为2个）放入监听套接字队列CSocekt::vector m_ListenSocketList;
+5.将各个监听的isock（目前为2个）放入监听套接字队列CSocekt::vector<lpngx_listening_t> m_ListenSocketList; 
 
 注意：这是在主进程中创建监听端口(主进程执行这个函数)，一旦后续fork()出来四个子进程，五个进程都在监听80和443两个端口。
 
+```cpp
 //监听端口【支持多个端口】，这里遵从nginx的函数命名
 //在创建worker进程之前就要执行这个函数；
 bool CSocekt::ngx_open_listening_sockets()
@@ -113,19 +131,23 @@ bool CSocekt::ngx_open_listening_sockets()
         return false;
     return true;
 }
-ngx_epoll_init
+```
+
+### ngx_epoll_init
+
 创建监听端口是在父进程中（ngx_open_listening_sockets）进行的，那么完整的初始化监听socket（包括创建连接池并且将每个监听socket放入到连接池的连接和放入epoll红黑树开始监听事件）是在子进程
 
 1.在这里创建一个epoll对象，一定要判断返回值，这是一个好习惯
 
 2.创建连接池
 
-3.每个监听socket增加一个 连接池中的连接，同时连接池内的连接（只有是监听socket的连接才可以）也可以通过lpngx_connection_t::p_Conn->listening = (*pos);找到监听socket对象。
+3.每个监听socket增加一个 连接池中的连接，同时连接池内的连接（只有是监听socket的连接才可以）也可以通过`lpngx_connection_t::p_Conn->listening = (*pos);`找到监听socket对象。
 
-4.连接池内的连接用p_Conn->rhandler = &CSocekt::ngx_event_accept;将读事件的相关处理方法设置为ngx_event_accept()函数。
+4.连接池内的连接用`p_Conn->rhandler = &CSocekt::ngx_event_accept;`将读事件的相关处理方法设置为`ngx_event_accept()`函数。
 
-5.监听socket上增加(EPOLL_CTL_ADD)监听的事件，读事件和TCP连接关闭即对应EPOLLIN|EPOLLRDHUP事件，
+5.监听socket上增加(EPOLL_CTL_ADD)监听的事件，读事件和TCP连接关闭即对应`EPOLLIN|EPOLLRDHUP`事件，
 
+```cpp
 //(1)epoll功能初始化，子进程中进行 ，本函数被ngx_worker_process_init()所调用
 int CSocekt::ngx_epoll_init()
 {
@@ -177,7 +199,13 @@ int CSocekt::ngx_epoll_init()
     } //end for 
     return 1;
 }
-ngx_close_connection直接关闭连接
+```
+
+
+
+### ngx_close_connection直接关闭连接
+
+```cpp
 //用户连入，我们accept4()时，得到的socket在处理中产生失败，则资源用这个函数释放【因为这里涉及到好几个要释放的资源，所以写成函数】
 //我们把ngx_close_accepted_connection()函数改名为让名字更通用，并从文件ngx_socket_accept.cxx迁移到本文件中，并改造其中代码，注意顺序
 void CSocekt::ngx_close_connection(lpngx_connection_t pConn)
@@ -191,11 +219,18 @@ void CSocekt::ngx_close_connection(lpngx_connection_t pConn)
     }    
     return;
 }
-ngx_epoll_oper_event对epoll事件的具体操作
-三次握手进来增加读事件ADD
-监听端口有ADD
-注意：原来的理解中，绑定ev.data.ptr这个事，只在EPOLL_CTL_ADD的时候做一次即可，但是发现EPOLL_CTL_MOD似乎会破坏掉ev.data.ptr，因此不管是EPOLL_CTL_ADD，还是EPOLL_CTL_MOD，ev.data.ptr都要去重新绑定！！！
+```
 
+
+
+### ngx_epoll_oper_event对epoll事件的具体操作
+
+- 三次握手进来增加读事件ADD
+- 监听端口有ADD
+
+注意：原来的理解中，绑定ev.data.ptr这个事，只在EPOLL_CTL_ADD的时候做一次即可，但是发现EPOLL_CTL_MOD**似乎会破坏掉ev.data.ptr**，因此不管是EPOLL_CTL_ADD，还是EPOLL_CTL_MOD，ev.data.ptr都要去重新绑定！！！
+
+```cpp
 //对epoll事件的具体操作
 //返回值：成功返回1，失败返回-1；
 int CSocekt::ngx_epoll_oper_event(
@@ -255,8 +290,12 @@ int CSocekt::ngx_epoll_oper_event(
     }
     return 1;
 }
-worker子进程处理网络事件（读、写）和定时器事件
-事件驱动模型ngx_epoll_process_events
+```
+
+## worker子进程处理网络事件（读、写）和定时器事件
+
+### 事件驱动模型ngx_epoll_process_events
+
 子进程初始化完监听端口和设置好子进程标题之后，执行for死循环，死循环内不断调用ngx_epoll_process_events。
 
 “事件驱动”，无非就是通过获取事件，通过获取到的事件并根据这个事件来调用适当的函数从而让整个程序干活，无非就是这点事;
@@ -265,18 +304,19 @@ worker子进程处理网络事件（读、写）和定时器事件
 
 2.一定要严密的判断，epoll_wait返回事件的数目，而事件会返回到参数m_events里，先判断events数目执行对应的判断。
 
-3.然后for循环里不断地通过m_events[i].data.ptr把发生了事件的连接池中的连接取出来并且revents = m_events[i].events;取出这个连接的事件类型
+3.然后for循环里不断地通过m_events[i].data.ptr把发生了事件的**连接池中的连接**取出来并且`revents = m_events[i].events;`取出**这个连接的事件类型**
 
 4.判断事件类型，
-对于读事件，(this->* (p_Conn->rhandler) )(p_Conn);函数指针
-对于监听套接字的连接会调用CSocekt::ngx_event_accept(c)，这在子进程创建时进行初始化ngx_epoll_init函数中就已经将连接池内的监听套接字连接的函数指针指定到ngx_event_accept上
-如果是已经连入，发送数据到这里，则这里执行的应该是 CSocekt::ngx_read_request_handler()
+	对于读事件，`(this->* (p_Conn->rhandler) )(p_Conn);`函数指针
+	对于监听套接字的连接会调用`CSocekt::ngx_event_accept(c)`，这在子进程创建时进行初始化ngx_epoll_init函数中就已经将连接池内的监听套接字连接的函数指针指定到ngx_event_accept上
+	如果是已经连入，发送数据到这里，则这里执行的应该是 `CSocekt::ngx_read_request_handler()`
 5.判断事件类型，对于写事件
 
-image-20220308120234266
+![image-20220308120234266](../images/202231-nginx整体框架解析/image-20220308120234266.png)
 
 注意我这个ngx_epoll_process_events中epoll_wait相当于事件收集器，各个事件对应的处理函数都属于事件处理器，用来消费事件。因此每个处理函数不能够被阻塞，而且应该尽快执行完成，否则整个for死循环中的ngx_epoll_process_events卡住了，下一次epoll_wait函数积累的事件越来越多整个程序就会崩盘了。
 
+```cpp
 //开始获取发生的事件消息
 //参数unsigned int timer：epoll_wait()阻塞的时长，单位是毫秒；
 //返回值，1：正常返回  ,0：有问题返回，一般不管是正常还是问题返回，都应该保持进程继续运行
@@ -382,15 +422,20 @@ int CSocekt::ngx_epoll_process_events(int timer)
     } //end for(int i = 0; i < events; ++i)     
     return 1;
 }
-处理三次握手连入事件ngx_event_accept
+```
+
+### 处理三次握手连入事件ngx_event_accept
+
 三次握手进来了，触发了epoll的读事件，前来调用此函数。accept是从已完成连接established队列取出该socket。
 
-1.用accept4或者accept返回得到socket注意设置成非阻塞。如果设置非阻塞失败那么必须要回收连接池的连接并且关闭socket。
-2.给新连接分配一个连接池内的连接ngx_get_connection。
-3.连接池内的连接设置这个连接的处理函数
-newc->rhandler = &CSocekt::ngx_read_request_handler; //设置已建立连接的socket当客户端发来数据来时的读处理函数
-newc->whandler = &CSocekt::ngx_write_request_handler; //设置已建立连接的socket的写处理函数
-4.客户端应该主动发送第一次的数据，这里将读事件加入epoll监控ngx_epoll_oper_event，这样当客户端发送数据来时，ngx_read_request_handler()被ngx_epoll_process_events()调用
+- 1.用accept4或者accept返回得到socket注意设置成非阻塞。如果设置非阻塞失败那么必须要回收连接池的连接并且关闭socket。
+- 2.给新连接分配一个连接池内的连接ngx_get_connection。
+- 3.连接池内的连接设置这个连接的处理函数
+  newc->rhandler = &CSocekt::ngx_read_request_handler;  //设置已建立连接的socket当客户端发来数据来时的读处理函数
+  newc->whandler = &CSocekt::ngx_write_request_handler; //设置已建立连接的socket的写处理函数
+- 4.客户端应该主动发送第一次的数据，这里将读事件加入epoll监控`ngx_epoll_oper_event`，这样当客户端发送数据来时，ngx_read_request_handler()被ngx_epoll_process_events()调用
+
+```cpp
 //建立新连接专用函数，当新连接进入时，本函数会被ngx_epoll_process_events()所调用
 void CSocekt::ngx_event_accept(lpngx_connection_t oldc)
 {
@@ -558,10 +603,14 @@ void CSocekt::ngx_event_accept(lpngx_connection_t oldc)
 
     return;
 }
-处理TCP连接客户端发来的数据ngx_read_request_handler
-引入一个消息头【结构】STRUC_MSG_HEADER，用来记录一些额外信息，可以用于处理过时包
-服务器 收包时， 收到： 包头+包体 ，我再额外附加一个消息头 ===》 消息头 + 包头 + 包体
+```
 
+### 处理TCP连接客户端发来的数据ngx_read_request_handler
+
+引入一个消息头【结构】`STRUC_MSG_HEADER`，用来记录一些额外信息，**可以用于处理过时包**
+服务器 收包时，  收到： 包头+包体  ，我再额外附加一个消息头 ===》  消息头 + 包头 + 包体
+
+```h
 //消息头，引入的目的是当收到数据包时，额外记录一些内容以备将来使用
 typedef struct _STRUC_MSG_HEADER
 {
@@ -569,10 +618,13 @@ typedef struct _STRUC_MSG_HEADER
 	uint64_t           iCurrsequence; //收到数据包时记录对应连接的序号，将来能用于比较是否连接已经作废用
 	//......其他以后扩展	
 }STRUC_MSG_HEADER,*LPSTRUC_MSG_HEADER;
+```
+
 对于连接池的每个连接都是有一个序号iCurrsequence，连接初始化的时候++iCurrsequence，连接释放的时候++iCurrsequence，因此当收到一个包的时候，将连接连接池的序号iCurrsequence记录在包的消息头中，当处理完这个包后想要发回给客户端的时候可以比较一下包的iCurrsequence与连接池的iCurrsequence是否一致，如果不一致说明连接已经断开了，丢弃即可。
 
-因此我们需要new一块新内存专门用来存取消息头 + 包头 + 包体
+因此我们需要new一块新内存专门用来存取`消息头 + 包头 + 包体`
 
+```cpp
 //来数据时候的处理，当连接上有数据来的时候，本函数会被ngx_epoll_process_events()所调用  ,官方的类似函数为ngx_http_wait_request_handler();
 void CSocekt::ngx_read_request_handler(lpngx_connection_t pConn)
 {  
@@ -666,15 +718,19 @@ void CSocekt::ngx_read_request_handler(lpngx_connection_t pConn)
 
     return;
 }
-注意这个函数调用了recvproc(pConn,pConn->precvbuf,pConn->irecvlen);最多只能收pConn->irecvlen个字节
+```
+
+注意这个函数调用了`recvproc(pConn,pConn->precvbuf,pConn->irecvlen);`最多只能收pConn->irecvlen个字节
 
 注意采用了状态机，非常的稳健！！
 
-recvproc
+#### recvproc
+
 四次挥手关闭连接，RST强制关闭连接，正常发包都能检测。
 
-伪代码
+**伪代码**
 
+```c
 recvproc(lpngx_connection_t pConn,char *buff,ssize_t buflen)
     n = recv(c->fd,buff,buflen,0);
     对返回值n判断，如果n的值异常，根据errno写相应日志或关闭socket，然后直接return -1;
@@ -691,12 +747,15 @@ recvproc(lpngx_connection_t pConn,char *buff,ssize_t buflen)
 	
 	//以下是没有出现错误的
     n>0,返回实际收到的字节数
+```
+
 如果recv()有问题，这个函数会把该释放的释放好，该处理的处理好
 
-特别注意：所有从10行开始走下来的错误，都认为异常：意味着我们要关闭客户端套接字要回收连接池中连接；
+**特别注意：**所有从10行开始走下来的错误，都认为异常：意味着我们要关闭客户端套接字要回收连接池中连接；
 
 一定要有严密的判断
 
+```cpp
 //接收数据专用函数--引入这个函数是为了方便，如果断线，错误之类的，这里直接 释放连接池中连接，然后直接关闭socket，以免在其他函数中还要重复的干这些事
 //参数c：连接池中相关连接
 //参数buff：接收数据的缓冲区
@@ -770,15 +829,20 @@ ssize_t CSocekt::recvproc(lpngx_connection_t pConn,char *buff,ssize_t buflen)  /
     //能走到这里的，就认为收到了有效数据
     return n; //返回收到的字节数
 }
-ngx_wait_request_handler_proc_p1
+```
+
+#### ngx_wait_request_handler_proc_p1
+
 包头收完整后的处理，我们称为包处理阶段1
 
-1.判断包是否合法，若不合法则状态机恢复为_PKG_HD_INIT，并且连接池的缓冲区头指针重新指定为最开始的
-2.那么char *pTmpBuffer = (char *)p_memory->AllocMemory(m_iLenMsgHeader + e_pkgLen,false);新分配一段内存并且将连接池的成员指针pConn->precvMemPointer = pTmpBuffer;指向这块内存（消息头加整个包长度的内存 ）
-3.填写消息头的内容，把连接池中连接序号记录到消息头里来，连接池的连接指针也记录到消息头里
-4.再填写包头内容，把包体内容拷贝到pTmpBuffer中
-5.如果该报文只有包头无包体，调用ngx_wait_request_handler_proc_plast()收完整包后的处理函数。
-6.如果该报文还需要继续收包体，修改状态机为_PKG_BD_INIT，并且连接池的缓冲区头指针指向包体。
+- 1.判断包是否合法，若不合法则状态机恢复为_PKG_HD_INIT，并且连接池的缓冲区头指针重新指定为最开始的
+- 2.那么`char *pTmpBuffer  = (char *)p_memory->AllocMemory(m_iLenMsgHeader + e_pkgLen,false);`新分配一段内存并且将连接池的成员指针`pConn->precvMemPointer = pTmpBuffer;`指向这块内存（消息头加整个包长度的内存 ）
+- 3.填写消息头的内容，把连接池中连接序号记录到消息头里来，连接池的连接指针也记录到消息头里
+- 4.再填写包头内容，把包体内容拷贝到pTmpBuffer中
+- 5.如果该报文只有包头无包体，调用ngx_wait_request_handler_proc_plast()收完整包后的处理函数。
+- 6.如果该报文还需要继续收包体，修改状态机为_PKG_BD_INIT，并且连接池的缓冲区头指针指向包体。
+
+```cpp
 //包头收完整后的处理，我们称为包处理阶段1【p1】：写成函数，方便复用
 //注意参数isflood是个引用
 void CSocekt::ngx_wait_request_handler_proc_p1(lpngx_connection_t pConn,bool &isflood)
@@ -845,10 +909,14 @@ void CSocekt::ngx_wait_request_handler_proc_p1(lpngx_connection_t pConn,bool &is
 
     return;
 }
-ngx_wait_request_handler_proc_plast
-如果包没问题那么就入消息队列并触发线程处理消息，注意进入
-并且要将当前连接的状态机恢复为_PKG_HD_INIT，并且连接池的缓冲区头指针重新指定为最开始的，且将precvMemPointer指针置为NULL（原先指向消息头加整个包的内存）
+```
 
+#### ngx_wait_request_handler_proc_plast
+
+如果包没问题那么就**入消息队列并触发线程处理消息**，注意进入
+并且要将**当前连接的状态机**恢复为_PKG_HD_INIT，并且连接池的缓冲区头指针重新指定为最开始的，且将precvMemPointer指针置为NULL（原先指向消息头加整个包的内存）
+
+```cpp
 //收到一个完整包后的处理【plast表示最后阶段】，放到一个函数中，方便调用
 //注意参数isflood是个引用
 void CSocekt::ngx_wait_request_handler_proc_plast(lpngx_connection_t pConn,bool &isflood)
@@ -870,13 +938,17 @@ void CSocekt::ngx_wait_request_handler_proc_plast(lpngx_connection_t pConn,bool 
     pConn->irecvlen        = m_iLenPkgHeader;  //设置好要接收数据的大小
     return;
 }
-inMsgRecvQueueAndSignal
+```
+
+#### inMsgRecvQueueAndSignal
+
 注意传入的参数是消息头+包头+包体
 
-将这一个完整消息放入线程池中的线程的接收数据消息队列里去
+将这一个完整消息放入**线程池中的线程**的接收数据消息队列里去
 
-并且调用Call激发线程来干活
+并且调用Call**激发线程来干活**
 
+```cpp
 //收到一个完整消息后，入消息队列，并触发线程池中线程来处理该消息
 void CThreadPool::inMsgRecvQueueAndSignal(char *buf)
 {
@@ -901,16 +973,23 @@ void CThreadPool::inMsgRecvQueueAndSignal(char *buf)
     Call();                                  
     return;
 }
-Call
-pthread_cond_signal唤醒一个等待该条件的线程，也就是可以唤醒卡在pthread_cond_wait(&m_pthreadCond, &m_pthreadMutex)的线程
+```
 
+#### Call
+
+pthread_cond_signal唤醒一个等待该条件的线程，也就是可以唤醒卡在`pthread_cond_wait(&m_pthreadCond, &m_pthreadMutex)`的线程
+
+```cpp
 while ( (pThreadPoolObj->m_MsgRecvQueue.size() == 0) && m_shutdown == false) {
     if(pThread->ifrunning == false)            
         pThread->ifrunning = true; 
     pthread_cond_wait(&m_pthreadCond, &m_pthreadMutex); 
 }
-如果拿得到消息即m_MsgRecvQueue.size()大小不为0，那么其中1个线程就可以拿到锁并且退出while循环，退出while循环去取消息并且调用相应的消息处理函数。
+```
 
+如果拿得到消息即`m_MsgRecvQueue.size()`大小不为0，那么其中1个线程就可以拿到锁并且退出while循环，退出while循环去取消息并且调用相应的消息处理函数。
+
+```cpp
 //来任务了，调一个线程池中的线程下来干活
 void CThreadPool::Call()
 {
@@ -938,8 +1017,11 @@ void CThreadPool::Call()
     } //end if 
     return;
 }
-处理TCP连接发送数据
-什么叫socekt可写？
+```
+
+### 处理TCP连接发送数据
+
+**什么叫socekt可写？**
 每一个tcp连接(socket)，都会有一个接收缓冲区 和 一个发送缓冲；
 发送缓冲区缺省大小一般10几k，接收缓冲区大概几十k，setsocketopt()来设置；
 
@@ -951,34 +1033,38 @@ send()【Windows端】,write()【linux】发送数据时，实际上这两个函
 
 两种解决方案，来自网络,意义在于我们可以通过这种解决方案来指导我们写代码；
 
-第一种最普遍的解决方案:
+- 第一种最普遍的解决方案:
+
 需要向socket写数据的时候把socket写事件通知加入到epoll中，等待可写事件，当可写事件来时操作系统会通知咱们；此时咱们可以调用wirte/send函数发送数据，当发送数据完毕后，把socket的写事件通知从红黑树中移除；
 缺点：即使发送很少的数据，也需要把事件通知加入到epoll，写完毕后，有需要把写事件通知从红黑树干掉,对效率有一定的影响【有一定的操作代价】
 
-改进方案：
-开始不把socket写事件通知加入到epoll,当我需要写数据的时候，直接调用write/send发送数据，如果能全部发送完那么最好；
+- 改进方案：
 
-但如果发送缓冲区满了send()返回了EAGIN无法一次性全部发送完，此时，我再把写事件通知加入到epoll，此时，就变成了在epoll驱动下写数据
+开始不把socket写事件通知加入到epoll,当我需要写数据的时候，**直接调用write/send发送数据**，如果能全部发送完那么最好；
+
+但如果**发送缓冲区满了send()返回了EAGIN**无法一次性全部发送完，此时，我再把写事件通知加入到epoll，此时，就变成了在epoll驱动下写数据
 
 当发送缓冲区可写（即有空间了）的时候，ngx_epoll_process_events函数中epoll_wait会通知有可写事件，这个时候我们调用ngx_write_request_handler来处理可写事件，当全部数据发送完毕后，再把写事件通知从epoll中干掉；
 
 优点：数据不多的时候，可以避免epoll的写事件的增加/删除，提高了程序的执行效率；
 
-msgSend待发送消息入到发消息队列
+#### msgSend待发送消息入到发消息队列
+
 主要的逻辑：
 
 1.CSocket::m_MsgSendQueue.push_back(psendbuf);将消息放入待发送消息队列中
 
 2.sem_post(&m_semEventSendQueue)让ServerSendQueueThread()流程走下来干活
 
-同步原理：
+**同步原理：**
 
-CSocekt::Initialize_subproc函数中初始化调用sem_init(&m_semEventSendQueue,0,0)对此信号量进行初始化为0。
+`CSocekt::Initialize_subproc`函数中初始化调用`sem_init(&m_semEventSendQueue,0,0)`对此信号量进行初始化为0。
 
-sem_wait()：测试指定信号量的值，如果该值>0，那么将该值减1然后该函数立即返回；如果该值 等于0，那么该线程将投入睡眠中，一直到该值>0，这个时候 那么将该值减1然后该函数立即返回；
+sem_wait()：测试指定信号量的值，如果该值>0，那么将该值**减1**然后该函数立即返回；如果该值 等于0，那么该线程将投入睡眠中，一直到该值>0，这个时候  那么将该值**减1**然后该函数立即返回；  
 
-semd_post()：能够将指定信号量值加1，即便当前没有其他线程在等待该信号量值也没关系；这也就保证了信号量不会丢失
+semd_post()：能够将指定信号量值**加1**，即便当前没有其他线程在等待该信号量值也没关系；这也就保证了信号量不会丢失
 
+```cpp
 //将一个待发送消息入到发消息队列中
 void CSocekt::msgSend(char *psendbuf) 
 {
@@ -1020,16 +1106,21 @@ void CSocekt::msgSend(char *psendbuf)
     }
     return;
 }
-ServerSendQueueThread处理发送消息队列的线程*
+```
+
+#### ServerSendQueueThread处理发送消息队列的线程*
+
 pthread_mutex_lock(&pSocketObj->m_sendMessageQueueMutex); //因为我们要操作发送消息对列
 
-发送消息，如果发送缓冲区满了，则需要通过epoll事件来驱动消息的继续发送，所以如果发送缓冲区满，则用这个连接池成员变量ngx_connection_s::atomic<int>iThrowsendCount;标记是依靠epoll来驱动的
+发送消息，如果发送缓冲区满了，则需要通过epoll事件来驱动消息的继续发送，所以如果发送缓冲区满，则用这个连接池成员变量`ngx_connection_s::atomic<int>iThrowsendCount;`标记是依靠epoll来驱动的
 
-1.sendsize>0且成功发送了整个包的所有数据，一下就发送出去这很顺利，那么把堆里面的存放消息的那块内存释放掉即可
-2.sendsize>0但是没有全部发送完毕(EAGAIN)，数据只发出去了一部分，但肯定是因为 发送缓冲区满了，EPOLL_MOD给当前连接增加一个监听可写事件
-3.sendsize == 0对方断开了，对方断开这个事件属于可读事件，会再recvproc函数中处理
-4.sendsize == -1表明 errno == EAGAIN ，服务器的发送缓冲区满了，那么和第2种清空一样，需要通过EPOLL_MOD给当前连接增加一个监听可写事件
-5.sendsize == -2，一般我认为都是对端断开的错误，对端断开需要把堆里面的存放消息的那块内存释放掉即可，操作系统会帮我们将这个socket连接从红黑树中移除掉
+- 1.sendsize>0且成功发送了整个包的所有数据，一下就发送出去这很顺利，那么把堆里面的存放消息的那块内存释放掉即可
+- 2.sendsize>0但是没有全部发送完毕(EAGAIN)，数据只发出去了一部分，但肯定是因为 发送缓冲区满了，EPOLL_MOD给当前连接增加一个监听可写事件
+- 3.sendsize == 0对方断开了，对方断开这个事件属于可读事件，会再recvproc函数中处理
+- 4.sendsize == -1表明 errno == EAGAIN ，服务器的发送缓冲区满了，那么和第2种清空一样，需要通过EPOLL_MOD给当前连接增加一个监听可写事件
+- 5.sendsize == -2，一般我认为都是对端断开的错误，对端断开需要把堆里面的存放消息的那块内存释放掉即可，操作系统会帮我们将这个socket连接从红黑树中移除掉
+
+```cpp
 //处理发送消息队列的线程
 void* CSocekt::ServerSendQueueThread(void* threadData)
 {    
@@ -1209,7 +1300,11 @@ void* CSocekt::ServerSendQueueThread(void* threadData)
     
     return (void*)0;
 }
-sendproc发送数据专用函数
+```
+
+#### sendproc发送数据专用函数
+
+```cpp
 //发送数据专用函数，返回本次发送的字节数
 //返回 > 0，成功发送了一些字节
 //=0，估计对方断了
@@ -1261,13 +1356,18 @@ ssize_t CSocekt::sendproc(lpngx_connection_t c,char *buff,ssize_t size)  //ssize
         }
     } //end for
 }
-ngx_write_request_handler(epoll通知后就调用这个函数)*
+```
+
+#### ngx_write_request_handler(epoll通知后就调用这个函数)*
+
 调用sendproc(pConn,pConn->psendbuf,pConn->isendlen);发送数据
 
-1.数据只发送了一部分，return返回，之后如果发送缓冲区可写epoll还会通知
-2.成功的发送完了所有的数据，就用EPOLL_MOD参数将写事件通知给去掉，epoll将不会继续监听写事件
-3.数据发送完毕那么就可以sem_post(&m_semEventSendQueue)试着通知ServerSendQueueThread可以继续发送数据了
-4.最后清空堆中存放消息的那块内存return返回
+- 1.数据只发送了一部分，**return返回**，之后如果发送缓冲区可写epoll还会通知
+- 2.成功的发送完了所有的数据，就用EPOLL_MOD参数将写事件通知给去掉，epoll将不会继续监听写事件
+- 3.数据发送完毕那么就可以sem_post(&m_semEventSendQueue)试着通知ServerSendQueueThread可以继续发送数据了
+- 4.最后清空堆中存放消息的那块内存**return返回**
+
+```cpp
 //设置数据发送时的写处理函数,当数据可写时epoll通知我们，我们在 int CSocekt::ngx_epoll_process_events(int timer)  中调用此函数
 //能走到这里，数据就是没法送完毕， 要继续发送
 void CSocekt::ngx_write_request_handler(lpngx_connection_t pConn)
@@ -1322,10 +1422,15 @@ void CSocekt::ngx_write_request_handler(lpngx_connection_t pConn)
     --pConn->iThrowsendCount;  //建议放在最后执行
     return;
 }
-连接池
-initconnection初始化连接池
-连接池的所有连接都放入m_connectionList，空闲连接都放入m_freeconnectionList，以后要取空闲连接就从空闲连接中取得。注意两个存储连接的链表类型是list，存储的是指针，指向具体连接池某一连接的内存。
+```
 
+## 连接池
+
+### initconnection初始化连接池
+
+连接池的所有连接都放入m_connectionList，空闲连接都放入m_freeconnectionList，以后要取空闲连接就从空闲连接中取得。注意两个存储连接的链表类型是list<lpngx_connection_t>，存储的是指针，指向具体连接池某一连接的内存。
+
+```cpp
 //初始化连接池
 void CSocekt::initconnection()
 {
@@ -1345,9 +1450,13 @@ void CSocekt::initconnection()
     m_free_connection_n = m_total_connection_n = m_connectionList.size(); //开始这两个列表一样大
     return;
 }
-GetOneToUse()连接初始化
+```
+
+#### GetOneToUse()连接初始化
+
 每次初始化connection都会++iCurrsequence;
 
+```cpp
 //分配出去一个连接的时候初始化一些内容,原来内容放在 ngx_get_connection()里，现在放在这里
 void ngx_connection_s::GetOneToUse()
 {
@@ -1368,13 +1477,19 @@ void ngx_connection_s::GetOneToUse()
 	FloodAttackCount  = 0;	                          //Flood攻击在该时间内收到包的次数统计
     iSendCount        = 0;                            //发送队列中有的数据条目数，若client只发不收，则可能造成此数过大，依据此数做出踢出处理 
 }
-ngx_get_connection
+```
+
+
+
+### ngx_get_connection
+
 多线程操纵链表CLock lock(&m_connectionMutex); 因此需要加锁
 
 从空闲队列取出连接池的连接并且调用GetOneToUse初始化连接，再绑定当前socket的fd。返回连接return p_Conn
 
 没有空闲连接则创建一个新的连接并且要放入总表队列调用GetOneToUse初始化连接，再绑定当前socket的fd。
 
+```cpp
 //从连接池中获取一个空闲连接【当一个客户端连接TCP进入，我希望把这个连接和我的 连接池中的 一个连接【对象】绑到一起，后续 我可以通过这个连接，把这个对象拿到，因为对象里边可以记录各种信息】
 lpngx_connection_t CSocekt::ngx_get_connection(int isock)
 {
@@ -1405,9 +1520,13 @@ lpngx_connection_t CSocekt::ngx_get_connection(int isock)
     //因为我们要采用延迟释放的手段来释放连接，因此这种 instance就没啥用，这种手段用来处理立即释放才有用。
 
 }
-clearconnection
+```
+
+### clearconnection
+
 清空整个连接池
 
+```cpp
 //最终回收连接池，释放内存
 void CSocekt::clearconnection()
 {
@@ -1422,11 +1541,15 @@ void CSocekt::clearconnection()
 		p_memory->FreeMemory(p_Conn);
 	}
 }
-ngx_free_connection()立即回收
+```
+
+### ngx_free_connection()立即回收
+
 用户没有三次握手接入之前我们可以直接立即回收
 
 PutOneToFree中会将此连接的序列号iCurrsequence自加1，以避免过期包的发送。
 
+```cpp
 //归还参数pConn所代表的连接到到连接池中，注意参数类型是lpngx_connection_t
 void CSocekt::ngx_free_connection(lpngx_connection_t pConn) 
 {
@@ -1443,9 +1566,13 @@ void CSocekt::ngx_free_connection(lpngx_connection_t pConn)
     ++m_free_connection_n;
     return;
 }
-PutOneToFree
+```
+
+#### PutOneToFree
+
 收到的包不全并且用户退出了，有必要将收到一半的包的内存释放掉
 
+```cpp
 //回收回来一个连接的时候做一些事
 void ngx_connection_s::PutOneToFree()
 {
@@ -1462,11 +1589,15 @@ void ngx_connection_s::PutOneToFree()
     }
 	iThrowsendCount = 0;                              //设置不设置感觉都行         
 }   
-inRecyConnectQueue延时回收
+```
+
+### inRecyConnectQueue延时回收
+
 用户三次握手进来了，但是断了，还是采用延时回收吧，延时回收也会将连接的序列号pConn->iCurrsequence自加1，以避免过期包的发送
 
-放入CSocekt::list<lpngx_connection_t>m_recyconnectionList然后ServerRecyConnectionThread线程自会处理
+放入`CSocekt::list<lpngx_connection_t>m_recyconnectionList`然后ServerRecyConnectionThread线程自会处理
 
+```cpp
 //将要回收的连接放到一个队列中来，后续有专门的线程会处理这个队列中的连接的回收
 //有些连接，我们不希望马上释放，要隔一段时间后再释放以确保服务器的稳定，所以，我们把这种隔一段时间才释放的连接先放到一个队列中来
 void CSocekt::inRecyConnectQueue(lpngx_connection_t pConn)
@@ -1498,9 +1629,13 @@ void CSocekt::inRecyConnectQueue(lpngx_connection_t pConn)
     --m_onlineUserCount;                   //连入用户数量-1
     return;
 }
-ServerRecyConnectionThread处理连接回收的线程
-伪代码
+```
 
+### ServerRecyConnectionThread处理连接回收的线程
+
+**伪代码**
+
+```cpp
 //处理连接回收的线程
 void* CSocekt::ServerRecyConnectionThread(void* threadData)
     while(1)
@@ -1514,8 +1649,11 @@ void* CSocekt::ServerRecyConnectionThread(void* threadData)
         if(g_stopEvent == 1) //要退出整个程序，那么肯定要先退出这个循环，所有连接硬释放
         做上面的相同行为而且不加时间判断，对所有连接全回收
 	endwhile(1)   
+```
+
 CSocket的静态成员函数，与线程池无关
 
+```cpp
 //处理连接回收的线程
 void* CSocekt::ServerRecyConnectionThread(void* threadData)
 {
@@ -1603,8 +1741,15 @@ lblRRTD:
     
     return (void*)0;
 }
-线程池
-线程类
+```
+
+
+
+## 线程池
+
+### 线程类
+
+```h
 //线程池相关类
 class CThreadPool
 {
@@ -1661,8 +1806,13 @@ private:
     std::list<char *>          m_MsgRecvQueue;      //接收数据消息队列 
 	int                        m_iRecvMsgQueueCount;//收消息队列大小
 };
-创建线程池（worker进程中执行）
-Create()会激发线程入口函数ThreadFunc
+```
+
+### 创建线程池（worker进程中执行）
+
+#### Create()会激发线程入口函数ThreadFunc
+
+```cpp
 //创建线程池中的线程，要手工调用，不在构造函数里调用了
 //返回值：所有线程都创建成功则返回true，出现错误则返回false
 bool CThreadPool::Create(int threadNum)
@@ -1703,32 +1853,40 @@ lblfor:
     }
     return true;
 }
-注意m_threadVector.push_back(pNew = new ThreadItem(this));这个this指针是线程池CThreadPool的指针，通过这一句指向CthreadPool的指针就传入ThreadItem中去了。
+```
+
+注意`m_threadVector.push_back(pNew = new ThreadItem(this));`这个this指针是线程池CThreadPool的指针，通过这一句指向CthreadPool的指针就传入ThreadItem中去了。
 
 CThreadPool是线程池的管理类，整个服务器只需这一个对象即可
 
-ThreadItem是线程的结构，包含线程句柄，线程各个状态等等，CthreadPool::vector<ThreadItem *> m_threadVector; 就是线程 容器，容器里就是各个线程了
+ThreadItem是线程的结构，包含线程句柄，线程各个状态等等，`CthreadPool::vector<ThreadItem *>  m_threadVector;` 就是线程 容器，容器里就是各个线程了
 
-特别注意：【很重要】
+**特别注意：**【很重要】
 
-线程池要求都执行阻塞到这一行pthread_cond_wait(&m_pthreadCond, &m_pthreadMutex);，在此之前create()函数不允许返回。因为如果不这样的话，先开的线程可能create()函数已经执行完毕了并且开始执行比如StopAll()函数进行修改甚至关闭了线程池资源了，但是所有线程还没有完全启动，这样会导致线程池异常。
+线程池要求都执行阻塞到这一行`pthread_cond_wait(&m_pthreadCond, &m_pthreadMutex);`，在此之前create()函数不允许返回。因为如果不这样的话，先开的线程可能create()函数已经执行完毕了并且开始执行比如StopAll()函数进行修改甚至关闭了线程池资源了，但是所有线程还没有完全启动，这样会导致线程池异常。 
 
 所以上面的lblfor循环是为了保证所有线程完全启动起来，以保证整个线程池中的线程正常工作。
 
-ThreadFunc()线程入口函数
+#### ThreadFunc()线程入口函数       
+
 精华代码：
 
+```cpp
 err = pthread_mutex_lock(&m_pthreadMutex);  
 while ( (pThreadPoolObj->m_MsgRecvQueue.size() == 0) && m_shutdown == false) {
     if(pThread->ifrunning == false)            
         pThread->ifrunning = true; 
     pthread_cond_wait(&m_pthreadCond, &m_pthreadMutex); 
 }
-注意在CThreadPool类中static void* ThreadFunc(void *threadData); 是一个静态函数，不存在this指针，因此临时定义CThreadPool *pThreadPoolObj = pThread->_pThis;
-注意m_pthreadCond是一个静态成员static pthread_cond_t m_pthreadCond;
-pthread_cond_t CThreadPool::m_pthreadCond = PTHREAD_COND_INITIALIZER; //初始化
-因此对于m_pthreadCond 而言pthread_cond_wait(&m_pthreadCond, &m_pthreadMutex); 刚开始时初始状态，没有什么东西来激发它，会卡在这里，而且m_pthreadMutex会被释放掉；
-第一个线程执行到这一句的时候，m_pthreadMutex会被释放掉，第二个线程得以在while循环中往下执行。如果有100个线程，最终结果是100个线程都会卡在这里并且m_pthreadMutex会被释放掉。这100个线程都在等待m_pthreadCond这个条件。
+```
+
+1. 注意在CThreadPool类中`static void* ThreadFunc(void *threadData); `是一个静态函数，不存在this指针，因此临时定义`CThreadPool *pThreadPoolObj = pThread->_pThis;`
+2. 注意m_pthreadCond是一个静态成员`static pthread_cond_t    m_pthreadCond;`   
+   `pthread_cond_t CThreadPool::m_pthreadCond = PTHREAD_COND_INITIALIZER;   //初始化`
+3. 因此对于m_pthreadCond 而言`pthread_cond_wait(&m_pthreadCond, &m_pthreadMutex); `刚开始时初始状态，没有什么东西来激发它，**会卡在这里，而且m_pthreadMutex会被释放掉；**
+   第一个线程执行到这一句的时候，m_pthreadMutex会被释放掉，第二个线程得以在while循环中往下执行。如果有100个线程，最终结果是100个线程都会卡在这里并且m_pthreadMutex会被释放掉。这100个线程都在等待m_pthreadCond这个条件。
+
+```cpp
 //线程入口函数，当用pthread_create()创建线程后，这个ThreadFunc()函数都会被立即执行；注意这个是静态函数，不带有this参数
 void* CThreadPool::ThreadFunc(void* threadData)
 {
@@ -1795,9 +1953,13 @@ void* CThreadPool::ThreadFunc(void* threadData)
     //能走出来表示整个程序要结束啊，怎么判断所有线程都结束？
     return (void*)0;
 }
-线程处理消息队列
-所有线程都卡在pthread_cond_wait(&m_pthreadCond, &m_pthreadMutex);才能初始化线程。
+```
 
+### 线程处理消息队列
+
+所有线程都卡在`pthread_cond_wait(&m_pthreadCond, &m_pthreadMutex);`才能初始化线程。
+
+```h
 //定义成员函数指针
 typedef bool (CLogicSocket::*handler)(  lpngx_connection_t pConn,      //连接池中连接的指针
                                         LPSTRUC_MSG_HEADER pMsgHeader,  //消息头指针
@@ -1822,19 +1984,28 @@ static const handler statusHandler[] =
 
 };
 #define AUTH_TOTAL_COMMANDS sizeof(statusHandler)/sizeof(handler) //整个命令有多少个，编译时即可知道
-threadRecvProcFunc
-ThreadFunc所有线程都阻塞在pthread_cond_wait处，当有消息来时有线程取到消息后会调用当前函数
+```
 
-1.用强制类型转换取得消息头和包头两个结构体。从包头中取出包的长度（注意要ntohs网络序转本机序）。
-2.如果没有包体只有包头，crc32校验码应该是0，若不为0丢弃包return。
-3.如果有包体，拿到包体并且服务器通过包体计算得到的crc32校验码，然后与客户端传来pPkgHeader->crc32校验码比较是否一致，若不一致丢弃且return。
-4.然后通过消息头取出连接池的连接指针p_Conn和消息头的iCurrsequence，然后比较连接池的此连接的p_Conn->iCurrsequence与消息头的iCurrsequence是否一致，若不一致说明连接已经关闭了。丢弃包直接return。
+#### threadRecvProcFunc
+
+**ThreadFunc所有线程都阻塞在pthread_cond_wait处，当有消息来时有线程取到消息后会调用当前函数**
+
+- 1.用强制类型转换取得消息头和包头两个结构体。从包头中取出包的长度（注意要ntohs网络序转本机序）。
+- 2.如果没有包体只有包头，crc32校验码应该是0，若不为0丢弃包return。
+- 3.如果有包体，拿到包体并且服务器通过包体计算得到的crc32校验码，然后与客户端传来pPkgHeader->crc32校验码比较是否一致，若不一致丢弃且return。
+- 4.然后通过消息头取出连接池的连接指针p_Conn和消息头的iCurrsequence，然后比较连接池的此连接的p_Conn->iCurrsequence与消息头的iCurrsequence是否一致，若不一致说明连接已经关闭了。丢弃包直接return。
+
+```cpp
 typedef struct _STRUC_MSG_HEADER{//消息头结构体
 	lpngx_connection_t pConn;         //记录对应的链接，注意这是个指针
 	uint64_t           iCurrsequence; //收到数据包时记录对应连接的序号，将来能用于比较是否连接已经作废用
 }STRUC_MSG_HEADER,*LPSTRUC_MSG_HEADER;
-5.判断长度是否大于AUTH_TOTAL_COMMANDS，若大于是恶意包，根本没有这么多命令，丢弃包并且return。
-6.(this->*statusHandler[imsgCode])(p_Conn,pMsgHeader,(char *)pPkgBody,pkglen-m_iLenPkgHeader);根据客户端发来包头内部的消息类型代码（区别每个不同的命令）调用对应的函数实现各个不同消息类型的处理逻辑。
+```
+
+- 5.判断长度是否大于AUTH_TOTAL_COMMANDS，若大于是恶意包，根本没有这么多命令，丢弃包并且return。
+- 6.`(this->*statusHandler[imsgCode])(p_Conn,pMsgHeader,(char *)pPkgBody,pkglen-m_iLenPkgHeader);`根据客户端发来包头内部的消息类型代码（区别每个不同的命令）调用对应的函数实现各个不同消息类型的处理逻辑。
+
+```cpp
 ///处理收到的数据包，由线程池来调用本函数，本函数是一个单独的线程；
 //pMsgBuf：消息头 + 包头 + 包体 ：自解释；
 void CLogicSocket::threadRecvProcFunc(char *pMsgBuf)
@@ -1905,22 +2076,31 @@ void CLogicSocket::threadRecvProcFunc(char *pMsgBuf)
     (this->*statusHandler[imsgCode])(p_Conn,pMsgHeader,(char *)pPkgBody,pkglen-m_iLenPkgHeader);
     return;	
 }
-释放线程池
+```
+
+### 释放线程池
+
 虽然一般不会调用这个函数，而且实在不行直接关闭程序系统帮我们释放资源，但是为了优雅一点自己实现一下。
 
-StopAll()
+#### StopAll() 
+
+```cpp
 err = pthread_mutex_lock(&m_pthreadMutex);  
 while ( (pThreadPoolObj->m_MsgRecvQueue.size() == 0) && m_shutdown == false) {
     if(pThread->ifrunning == false)            
         pThread->ifrunning = true; 
     pthread_cond_wait(&m_pthreadCond, &m_pthreadMutex); 
 }
+```
+
 先将所有线程安全退出后，再将内存释放。“优雅干净”
 
-1.首先给个判断m_shutdown避免重复释放，然后m_shutdown置为true表示要关闭线程池了，这是个静态变量static bool CThreadPool::m_shutdown = false;
-2.pthread_cond_broadcast广播会激发ThreadPool的静态成员m_pthreadCond，一旦激发成功pthread_cond_wait(&m_pthreadCond, &m_pthreadMutex); 的线程被唤醒了，并且这个while循环条件不满足，所有线程都去拿锁m_pthreadMutex，其他未拿到锁的线程只能卡死，等待上个线程退出释放锁，最终所有线程return退出。
-3.for循环pthread_join回收退出的线程资源直至所有线程都退出
-4.通过m_threadVector容器中的成员指针将之前new出来的ThreadItem内存释放。
+- 1.首先给个判断m_shutdown避免重复释放，然后m_shutdown置为true表示要关闭线程池了，这是个静态变量`static bool CThreadPool::m_shutdown = false;`
+- 2.pthread_cond_broadcast广播会激发ThreadPool的静态成员m_pthreadCond，一旦激发成功pthread_cond_wait(&m_pthreadCond, &m_pthreadMutex); 的线程被唤醒了，并且这个while循环条件不满足，所有线程都去拿锁m_pthreadMutex，其他未拿到锁的线程只能卡死，等待上个线程退出释放锁，最终所有线程return退出。
+- 3.for循环pthread_join回收退出的线程资源直至所有线程都退出
+- 4.通过m_threadVector容器中的成员指针将之前new出来的ThreadItem内存释放。
+
+```c
 //停止所有线程【等待结束线程池中所有线程，该函数返回后，应该是所有线程池中线程都结束了】
 void CThreadPool::StopAll() 
 {
@@ -1962,6 +2142,11 @@ void CThreadPool::StopAll()
     ngx_log_stderr(0,"CThreadPool::StopAll()成功返回，线程池中线程全部正常结束!");
     return;    
 }
+```
+
+### 
+
+```cpp
 //将一个待发送消息入到发消息队列中
 void CSocekt::msgSend(char *psendbuf) 
     上锁m_sendMessageQueueMutex
@@ -1973,6 +2158,11 @@ void CSocekt::msgSend(char *psendbuf)
     m_MsgSendQueue.push_back(psendbuf);//放入发送消息队列
     sem_post(&m_semEventSendQueue)//信号量加一，让ServerSendQueueThread()流程走下来干活
     
+```
+
+
+
+```cpp
 //处理发送消息队列的线程
 void* CSocekt::ServerSendQueueThread(void* threadData)
     while(程序不退出)
@@ -1996,7 +2186,17 @@ void* CSocekt::ServerSendQueueThread(void* threadData)
         解锁
 	end while(程序不退出)
  	return;
+```
 
+
+
+```cpp
+
+```
+
+
+
+```cpp
 //设置数据发送时的写处理函数,当数据可写时epoll通知我们，我们在 int CSocekt::ngx_epoll_process_events(int timer)  中调用此函数
 //在 int CSocekt::ngx_epoll_process_events(int timer)  中epoll_wait阻塞了
 //能走到这里，数据就是没法送完毕，要继续发送
@@ -2009,6 +2209,11 @@ void CSocekt::ngx_write_request_handler(lpngx_connection_t pConn)
 		ngx_epoll_oper_event//把写事件通知从epoll中干掉
         
     sem_post(&m_semEventSendQueue)//信号量加一，让ServerSendQueueThread()流程走下来干活
+```
+
+
+
+```cpp
 //来数据时候的处理，当连接上有数据来的时候，本函数会被ngx_epoll_process_events()所调用  ,官方的类似函数为ngx_http_wait_request_handler();
 void CSocekt::ngx_read_request_handler(lpngx_connection_t pConn)
     ssize_t reco = recvproc(pConn,pConn->precvbuf,pConn->irecvlen); //收取数据
@@ -2018,6 +2223,11 @@ void CSocekt::ngx_read_request_handler(lpngx_connection_t pConn)
 		g_threadpool.inMsgRecvQueueAndSignal(pConn->precvMemPointer); //入消息队列并触发线程处理消息
 	
     
+```
+
+
+
+```cpp
 //收到一个完整消息后，入消息队列，并触发线程池中线程来处理该消息
 void CThreadPool::inMsgRecvQueueAndSignal(char *buf)
 {
@@ -2028,6 +2238,11 @@ void CThreadPool::inMsgRecvQueueAndSignal(char *buf)
     Call();
     return;
 }
+```
+
+
+
+```cpp
 //来任务了，调一个线程池中的线程下来干活
 void CThreadPool::Call()
 {
@@ -2036,6 +2251,13 @@ void CThreadPool::Call()
             ngx_log_stderr(0,"CThreadPool::Call()中发现线程池中当前空闲线程数量为0，要考虑扩容线程池了!");
     return;
 }
+```
+
+
+
+
+
+```cpp
 //处理连接回收的线程
 void* CSocekt::ServerRecyConnectionThread(void* threadData)
     while(1)
@@ -2050,6 +2272,11 @@ void* CSocekt::ServerRecyConnectionThread(void* threadData)
         做上面的相同行为而且不加时间判断，对所有连接全回收
 	endwhile(1)   
         
+```
+
+
+
+```cpp
 //归还参数pConn所代表的连接到到连接池中，注意参数类型是lpngx_connection_t
 void CSocekt::ngx_free_connection(lpngx_connection_t pConn) 
 {
@@ -2071,6 +2298,11 @@ void CSocekt::ngx_free_connection(lpngx_connection_t pConn)
 	std::list<lpngx_connection_t>  m_connectionList;                      //连接列表【连接池】
 	std::list<lpngx_connection_t>  m_freeconnectionList;                  //空闲连接列表【这里边装的全是空闲的
 	std::list<lpngx_connection_t>  m_recyconnectionList;                  //将要释放的连接放这里
+```
+
+
+
+```cpp
 //回收回来一个连接的时候做一些事
 void ngx_connection_s::PutOneToFree()
 {
@@ -2088,10 +2320,14 @@ void ngx_connection_s::PutOneToFree()
 
     iThrowsendCount = 0;                              //设置不设置感觉都行         
 }
-业务逻辑
+```
+
+## 业务逻辑
+
 线程池里面地线程都“嗷嗷待哺”地等待客户端发来消息，线程池地线程都会执行threadRecvProcFunc函数，这个函数会根据发来的消息包的不同执行不同的逻辑函数。
 
-心跳包
+### 心跳包
+
 心跳包其实就是 一个普通的数据包；
 
 一般每个几十秒，最长一般也就是1分钟【10秒-60秒之间】，有客户端主动发送给服务器；服务器收到之后，一般会给客户端返回一个心跳包；
@@ -2100,12 +2336,12 @@ void ngx_connection_s::PutOneToFree()
 
 作为一个好的客户端程序，如果你发送了心跳包给服务器，但是在90或者100秒之内，你[客户端]没有收到服务器回应的心跳包，那么你就应该主动关闭与服务器端的链接，并且如果业务需要重连，客户端程序在关闭这个连接后还要重新主动再次尝试连接服务器端；客户端程序 也有必要提示使用者 与服务器的连接已经断开；
 
-为什么引入心跳包？
+**为什么引入心跳包？**
 
 常规客户端关闭，服务器端能感知到；但是有一种特殊情况，连接断开c/s都感知不到；
 
 c /s程序运行在不同的两个物理电脑上；tcp已经建立；
-拔掉c /s程序的网线； 拔掉网线导致服务器感知不到客户端断开，这个事实，一定要知道；
+拔掉c /s程序的网线； **拔掉网线导致服务器感知不到客户端断开**，这个事实，一定要知道；
 为了应对拔网线，导致不知道对方是否断开了tcp连接这种事，这就是我们引入心跳包机制的原因；
 超时没有发送来心跳包，那么就会将对端的socket连接close掉，回收资源；这就是心跳包的作用；
 其他作用：检测网络延迟等等
@@ -2115,8 +2351,11 @@ tcp本身keepalive机制；因为检测时间不好控制，所以不适合我�
 
 因此连接池的每个连接引入一个成员变量lastPingTime记录上一次的ping命令（心跳包）的时间，不断地更新
 
-处理发来的心跳包
-_HandlePing
+#### 处理发来的心跳包
+
+##### _HandlePing
+
+```cpp
 //接收并处理客户端发送过来的ping包
 bool CLogicSocket::_HandlePing(lpngx_connection_t pConn,LPSTRUC_MSG_HEADER pMsgHeader,char *pPkgBody,unsigned short iBodyLength)
 {
@@ -2133,7 +2372,11 @@ bool CLogicSocket::_HandlePing(lpngx_connection_t pConn,LPSTRUC_MSG_HEADER pMsgH
     //ngx_log_stderr(0,"成功收到了心跳包并返回结果！");
     return true;
 }
-SendNoBodyPkgToClient
+```
+
+##### SendNoBodyPkgToClient
+
+```cpp
 //发送没有包体的数据包给客户端
 void CLogicSocket::SendNoBodyPkgToClient(LPSTRUC_MSG_HEADER pMsgHeader,unsigned short iMsgCode)
 {
@@ -2152,22 +2395,31 @@ void CLogicSocket::SendNoBodyPkgToClient(LPSTRUC_MSG_HEADER pMsgHeader,unsigned 
     msgSend(p_sendbuf);
     return;
 }
-检测心跳时间
-配置文件
+```
+
+#### 检测心跳时间
+
+##### 配置文件
+
 20秒；超过20*3 +10 =70秒，仍旧没收到心跳包，那么服务器端就把tcp断开；或者20秒直接断开TCP连接
 增加配置Sock_WaitTimeEnable，Sock_MaxWaitTime
 
+```conf
 #Sock_WaitTimeEnable：是否开启踢人时钟，1：开启   0：不开启
 Sock_WaitTimeEnable = 1
 #多少秒检测一次是否 心跳超时，只有当Sock_WaitTimeEnable = 1时，本项才有用
 Sock_MaxWaitTime = 20
 #当时间到达Sock_MaxWaitTime指定的时间时，直接把客户端踢出去，只有当Sock_WaitTimeEnable = 1时，本项才有用
 Sock_TimeOutKick = 0
-CSocekt::AddToTimerQueue
-在ngx_event_accept（三次握手成功后）调用AddToTimerQueue()添加一个定时器。每次进来一个用户，就往时间队列multimap（有序的键/值对，但它可以保存重复的元素）增加一个连接。
-每次插入时间队列会按键值 自动排序 小->大。并且将时间队列头部时间值（最早时间）保存到m_timer_value_里
-std::multimap<time_t, LPSTRUC_MSG_HEADER> m_timerQueuemap;键：时间，值：消息头（消息头存放连接指针和连接序号）。
+```
 
+##### CSocekt::AddToTimerQueue
+
+在**ngx_event_accept**（三次握手成功后）调用AddToTimerQueue()添加一个**定时器**。每次进来一个用户，就往时间队列multimap（有序的键/值对，但它可以保存重复的元素）增加一个连接。
+每次插入时间队列会按键值 自动排序 小->大。并且将时间队列**头部时间值（最早时间）**保存到m_timer_value_里
+`std::multimap<time_t, LPSTRUC_MSG_HEADER>  m_timerQueuemap;`键：时间，值：消息头（消息头存放连接指针和连接序号）。
+
+```cpp
 //设置踢出时钟(向multimap表中增加内容)，用户三次握手成功连入，然后我们开启了踢人开关【Sock_WaitTimeEnable = 1】，那么本函数被调用；
 void CSocekt::AddToTimerQueue(lpngx_connection_t pConn)
 {
@@ -2185,12 +2437,17 @@ void CSocekt::AddToTimerQueue(lpngx_connection_t pConn)
     m_timer_value_ = GetEarliestTime(); //计时队列头部时间值保存到m_timer_value_里
     return;    
 }
-CSocekt::ServerSendQueueThread处理时间队列线程
+```
+
+##### CSocekt::ServerSendQueueThread处理时间队列线程
+
 创建一个新线程，专门处理事件队列里心跳包未发送的连接
 
-每次取出m_timer_value_最早时间，判断有没有连接是已经过期的（过久未发心跳包）
-通过GetOverTimeTimer根据给的当前时间，从m_timeQueuemap找到比这个时间更老（更早）的节点【1个】返回去，这些节点都是时间超过了，要处理的节点
-然后对要处理的时间过期节点，该去检测心跳包是否超时的事宜，是否要踢出这个连接
+- 每次取出m_timer_value_最早时间，判断有没有连接是已经过期的（过久未发心跳包）
+- 通过GetOverTimeTimer根据给的当前时间，从m_timeQueuemap找到比这个时间更老（更早）的节点【1个】返回去，这些节点都是时间超过了，要处理的节点
+- 然后对要处理的时间过期节点，该去检测心跳包是否超时的事宜，是否要踢出这个连接
+
+```cpp
 //时间队列监视和处理线程，处理到期不发心跳包的用户踢出的线程
 void* CSocekt::ServerTimerQueueMonitorThread(void* threadData)
 {
@@ -2237,7 +2494,11 @@ void* CSocekt::ServerTimerQueueMonitorThread(void* threadData)
 
     return (void*)0;
 }
-CLogicSocket::procPingTimeOutChecking
+```
+
+##### CLogicSocket::procPingTimeOutChecking
+
+```cpp
 //心跳包检测时间到，该去检测心跳包是否超时的事宜，本函数是子类函数，实现具体的判断动作
 void CLogicSocket::procPingTimeOutChecking(LPSTRUC_MSG_HEADER tmpmsg,time_t cur_time)
 {
@@ -2267,9 +2528,13 @@ void CLogicSocket::procPingTimeOutChecking(LPSTRUC_MSG_HEADER tmpmsg,time_t cur_
     }
     return;
 }
-CSocekt::DeleteFromTimerQueue
+```
+
+##### CSocekt::DeleteFromTimerQueue
+
 zdClosesocketProc(p_Conn)会调用此函数，主要从时间队列中删除并且释放内存
 
+```cpp
 //把指定用户tcp连接从timer表中抠出去
 void CSocekt::DeleteFromTimerQueue(lpngx_connection_t pConn)
 {
@@ -2298,11 +2563,17 @@ lblMTQM:
 	}
     return;    
 }
-测试
-如何把发送缓冲区撑满
+```
+
+
+
+## 测试
+
+### 如何把发送缓冲区撑满
+
 （1）每次服务器给客户端发送65K左右的数据，发送到第20次才出现服务器的发送缓冲区满；这时**客户端收了1个包(65K)**，【触发了epoll可写事件，此时执行了 ngx_write_request_handler()】
 
-（2）我又发包，连续成功发送了16次，才又出现发送缓冲区满；我客户端再收包，结果连续收了16个包，服务器才又出现ngx_write_request_handler()函数被成功执行，这表示客户端连续收了16次包，服务器的发送缓冲区才倒出地方来；
+（2）我又发包，连续成功发送了16次，才又出现发送缓冲区满；我客户端再收包，结果连续**收了16个包**，服务器才又出现ngx_write_request_handler()函数被成功执行，这表示客户端连续收了16次包，服务器的发送缓冲区才倒出地方来；
 
 （3）此后，大概服务器能够连续发送16次才再出现发送缓冲区满，客户端连续收16次，服务器端才出现ngx_write_request_handler()被执行【服务器的发送缓冲区有地方】；
 
@@ -2313,20 +2584,22 @@ lblMTQM:
 （2）LT模式下，我们发送数据采用的 改进方案 是非常有效的，在很大程度上提高了效率；
 
 （3） 发送缓冲区大概10-几10K,但是我们实际测试的时候，成功的发送出去了1000多k数据才报告发送缓冲区满；
-当我们发送端调用send()发送数据时，操作系统底层已经把数据发送到了 该连接的接收端 的接收缓存，这个接收缓存大概有几百K，
+当我们发送端调用send()发送数据时，操作系统底层已经把数据发送到了 该连接的接收端 的**接收缓存**，这个接收缓存大概有几百K，
 千万不要认为发送缓冲区只有几十K，所以我们send()几十k就能把发送缓冲区填满；
 
-image-20220309160014668
+![image-20220309160014668](../images/202231-nginx整体框架解析/image-20220309160014668.png)
 
 （4）不管怎么说，主要对方不接收数据，发送方的发送缓冲区总有满的时候；当发送缓冲满的时候，我们发送数据就会使用ngx_write_request_handler（）来执行了，所以现在看起来，我们整个的服务器的发送数据的实现代码是正确的；
 
-高并发测试
+### 高并发测试
+
 并发数量取决于很多因素：
 
-(1)采用的开发技术：epoll，支持数十万并发
-(2)这个程序收发数据的频繁程度，以及具体 要处理的业务复杂程度
-(3)服务器实际的物理内存；可用的物理内存数量，会直接决定你能支持的并发连接
-(4)一些其他的tcp/ip配置项
+- (1)采用的开发技术：epoll，支持数十万并发
+- (2)这个程序收发数据的频繁程度，以及具体 要处理的业务复杂程度
+- (3)服务器实际的物理内存；可用的物理内存数量，会直接决定你能支持的并发连接
+- (4)一些其他的tcp/ip配置项
+
 一般，我们日常所写的服务器程序，支持几千甚至1-2万的并发，基本上就差不多了；一个服务器程序，要根据我们具体的物理内存，以及我们具体要实现的业务等等因素，控制能够同时连入的客户端数量；如果你允许客户端无限连入，那么你的服务器肯定会崩溃；
 
 这里我的解决方法是引入一个新变量m_onlineUserCount
@@ -2336,8 +2609,10 @@ void CSocekt::inRecyConnectQueue(lpngx_connection_t pConn) 连入人数-1
 
 控制连入用户数量的解决思路：如果同时连入的用户数量超过了允许的最大连入数量时，我们就把这个连入的用户直接踢出去；
 
-安全问题思考
-防范SYN Flood攻击
+### 安全问题思考
+
+#### 防范SYN Flood攻击
+
 以游戏服务器为例：
 
 假设我们认为一个合理的客户端一秒钟发送数据包给服务器不超过10个；
@@ -2351,6 +2626,7 @@ void CSocekt::inRecyConnectQueue(lpngx_connection_t pConn) 连入人数-1
 
 ngx_wait_request_handler_proc_plast（）判断是否isflood，选择释放内存还是放入消息队列。
 
+```cpp
 //测试是否flood攻击成立，成立则返回true，否则返回false
 bool CSocekt::TestFlood(lpngx_connection_t pConn)
 {
@@ -2382,14 +2658,19 @@ bool CSocekt::TestFlood(lpngx_connection_t pConn)
 	}
 	return reco;
 }
-收到太多数据包处理不过来
+```
+
+####  收到太多数据包处理不过来
+
 限速：epoll技术，一个限速的思路；在epoll红黑树节点中，把这个EPOLLIN【可读】通知干掉；系统不会通知，服务器就不会去读，数据一直积累在接收缓冲区里，客户端那边会的发送缓冲区会满，客户端会减慢速度发送甚至停止发送。
 
 数据报太多的话，会在printTDInfo()中做了一个简单提示，大家根据需要自己改造代码；
 
-积压太多数据包发送不出去
+#### 积压太多数据包发送不出去
+
 见void CSocekt::msgSend(char *psendbuf) ，增加一个判断
 
+```c
 //将一个待发送消息入到发消息队列中
 void CSocekt::msgSend(char *psendbuf) 
 {
@@ -2431,32 +2712,43 @@ void CSocekt::msgSend(char *psendbuf)
     }
     return;
 }
-连入安全的进一步完善
+```
+
+#### 连入安全的进一步完善
+
 void CSocekt::ngx_event_accept(lpngx_connection_t oldc)
 
-//如果某些恶意用户连上来发了1条数据就断，不断连接，会导致频繁调用ngx_get_connection()使用我们短时间内产生大量连接，危及本服务器安全
-if(m_connectionList.size() > (m_worker_connections * 5))
-{
-    //比如你允许同时最大2048个连接，但连接池却有了 2048*5这么大的容量，这肯定是表示短时间内 产生大量连接/断开，因为我们的延迟回收机制，这里连接还在垃圾池里没有被回收
-    if(m_freeconnectionList.size() < m_worker_connections)
-    {
-        //整个连接池这么大了，而空闲连接却这么少了，所以我认为是  短时间内 产生大量连接，发一个包后就断开，我们不可能让这种情况持续发生，所以必须断开新入用户的连接
-        //一直到m_freeconnectionList变得足够大【连接池中连接被回收的足够多】
-        close(s);
-        return ;   
-    }
-}
-压力测试
+```c
+        //如果某些恶意用户连上来发了1条数据就断，不断连接，会导致频繁调用ngx_get_connection()使用我们短时间内产生大量连接，危及本服务器安全
+        if(m_connectionList.size() > (m_worker_connections * 5))
+        {
+            //比如你允许同时最大2048个连接，但连接池却有了 2048*5这么大的容量，这肯定是表示短时间内 产生大量连接/断开，因为我们的延迟回收机制，这里连接还在垃圾池里没有被回收
+            if(m_freeconnectionList.size() < m_worker_connections)
+            {
+                //整个连接池这么大了，而空闲连接却这么少了，所以我认为是  短时间内 产生大量连接，发一个包后就断开，我们不可能让这种情况持续发生，所以必须断开新入用户的连接
+                //一直到m_freeconnectionList变得足够大【连接池中连接被回收的足够多】
+                close(s);
+                return ;   
+            }
+        }
+```
+
+### 压力测试
+
 一般要测试很多天，跑的时间长了可能 会暴露下次，跑的时间短了可能还暴露不出来；
 
+```c
 #define _CONNECTION_COUNT_          2048      //创建多少个连接，此值越大，当然recv失败的机会越大，返回10060,表示超时，setsockopt里设置了5秒的；
 #define _THREAD_COUNT_              100       //准备创建这么多个线程
 #define CESHIXIBIAO _CONNECTION_COUNT_ + 2000 //测试下标
 #define SERVERIPADDR "192.168.200.129"
 #define DEFAULT_PORT 80
 #define _RECVTIMEOUT_               1500 //超时等待时间（单位：毫秒）
+```
+
 初始化socket后创建100个线程，线程具体执行如下所示：
 
+```c
 ScanThread
     socket()//所有线程加起来一共创建2048个线程
     connect()
@@ -2468,6 +2760,8 @@ ScanThread
     FunccreateSocket()//模拟把断的socket进行重连
         socket()
         connect(); 
+```
+
 建议：
 
 (1)测试收包，简单的逻辑处理，发包；
@@ -2479,32 +2773,38 @@ windows也建议单独用一个电脑来测试；
 
 (3)测试什么？
 
-程序崩溃，这明显不行，肯定要解决
-程序运行异常，比如过几个小时，服务器连接不上了；没有回应了，你发过来的包服务器处理不了了；
-服务器程序占用的内存才能不断增加，增加到一定程度，可能导致整个服务器崩溃；
+1. 程序崩溃，这明显不行，肯定要解决
+2. 程序运行异常，比如过几个小时，服务器连接不上了；没有回应了，你发过来的包服务器处理不了了；
+3. 服务器程序占用的内存才能不断增加，增加到一定程度，可能导致整个服务器崩溃；
+
 top -p 子进程ID：显示进程占用的内存和cpu百分比，用q可以退出；
 top -p pid,推荐文章：https://www.cnblogs.com/dragonsuc/p/5512797.html
 
-image-20220217170617051
+![image-20220217170617051](../images/202231-nginx整体框架解析/image-20220217170617051.png)
 
-cat /proc/子进程ID/status ———其中VmRSS: 7700 kB，占用的实际内存。
+cat /proc/子进程ID/status   ---------其中VmRSS:     7700 kB，占用的实际内存。
 
-image-20220217170312468
+![image-20220217170312468](../images/202231-nginx整体框架解析/image-20220217170312468.png)
 
-最大连接是1018
-image-20220217170445780
+#### 最大连接是1018
+
+![image-20220217170445780](../images/202231-nginx整体框架解析/image-20220217170445780.png)
 
 日志中报：CSocekt::ngx_event_accept()中accept4()失败
 这个跟 用户进程可打开的文件数限制有关； 因为系统为每个tcp连接都要创建一个socekt句柄，每个socket句柄同时也是一个文件句柄；
 
+```bash
 fengyun@ubuntu:~/share/nginx$ ulimit -n
 1024
-通过ulimit -n可以看到进程允许打开的文件数目限制是1024。而减去标准输入输出，错误输出，日志文件，监听端口等这几个占用的fd后数目是1018。
+```
+
+通过`ulimit -n`可以看到进程允许打开的文件数目限制是1024。而减去标准输入输出，错误输出，日志文件，监听端口等这几个占用的fd后数目是1018。
 
 我们就必须修改linux对当前用户的进程 同时打开的文件数量的限制；
 
-惊群
-惊群：1个master进程 4个worker进程
+### 惊群
+
+惊群：1个master进程  4个worker进程
 
 一个连接进入，惊动了4个worker进程，但是只有一个worker进程accept();其他三个worker进程被惊动，这就叫惊群；
 
@@ -2512,12 +2812,15 @@ fengyun@ubuntu:~/share/nginx$ ulimit -n
 
 配置nginx的worker子进程数目为4，然后借助telnet进行连接测试
 
+```c
 fengyun@ubuntu:~/share/nginx$ telnet 192.168.200.129 80
-在ngx_epoll_process_events()加入一个测试代码ngx_log_stderr(0,"惊群测试:events=%d,进程id=%d",events,ngx_pid);
+```
+
+在ngx_epoll_process_events()加入一个测试代码`ngx_log_stderr(0,"惊群测试:events=%d,进程id=%d",events,ngx_pid); `
 
 可以观察到
 
-image-20220217193302164
+![image-20220217193302164](../images/202231-nginx整体框架解析/image-20220217193302164.png)
 
 官方nginx解决惊群的办法：锁，进程之间的锁；谁获得这个锁，谁就往监听端口增加EPOLLIN标记，有了这个标记，客户端连入就能够被服务器感知到；
 
@@ -2526,76 +2829,93 @@ reuseport【复用端口】,是一种套接字的复用机制，允许将多个�
 
 但是注意目前master进程中在ngx_open_listening_sockets创建了一个监听套接字，创建了四个worker进程的监听套接字和master套接字是同一个，即使设置了reuseport仍然会产生惊群现象、
 
-深入浅出 Linux 惊群：现象、原因和解决方案在一个 epoll 上睡眠的多个 task，如果在一个 LT 模式下的 fd 的事件上来，会唤醒 epoll 睡眠队列上的所有 task，而 ET 模式下，仅仅唤醒一个 task，这是 epoll”惊群”的根源。
+[深入浅出 Linux 惊群：现象、原因和解决方案](https://zhuanlan.zhihu.com/p/385410196)在一个 epoll 上睡眠的多个 task，如果在一个 LT 模式下的 fd 的事件上来，会唤醒 epoll 睡眠队列上的所有 task，而 ET 模式下，仅仅唤醒一个 task，这是 epoll"惊群"的根源。
 
 看了这位腾讯 IEG 后台开发工程师的文章，我选择了试着在worker进程中使用ngx_open_listening_sockets，每个worker进程都会创建一个监听套接字listenfd，然后使用reuseport
 
-性能优化
+## 性能优化
+
 从两个方面看下性能优化问题；
 
 软件层面：
 
-充分利用cpu，比如刚才惊群问题；
-深入了解tcp/ip协议，通过一些协议参数配置来进一步改善性能；
-处理业务逻辑方面，算法方面有些内容，可以提前做好；
+1. 充分利用cpu，比如刚才惊群问题；
+2. 深入了解tcp/ip协议，通过一些协议参数配置来进一步改善性能；
+3. 处理业务逻辑方面，算法方面有些内容，可以提前做好；
+
 硬件层面【花钱搞定】：
 
-高速网卡，增加网络带宽；
-专业服务器；数十个核心，马力极其强；
-内存：容量大，访问速度快；
-主板啊，总线不断升级的；
-性能优化的实施
-绑定cpu、提升进程优先级
-一个worker进程运行在一个核上；为什么能够提高性能呢？
+1. 高速网卡，增加网络带宽；
+2. 专业服务器；数十个核心，马力极其强；
+3. 内存：容量大，访问速度快；
+4. 主板啊，总线不断升级的；
+
+### 性能优化的实施
+
+#### 绑定cpu、提升进程优先级
+
+- 一个worker进程运行在一个核上；为什么能够提高性能呢？
+
 cpu：缓存；cpu缓存命中率问题；把进程固定到cpu核上，可以大大增加cpu缓存命中率，从而提高程序运行效率；
 nginx官方有一个函数worker_cpu_affinity【cpu亲和性】，就是为了把worker进程固定的绑到某个cpu核上；
 ngx_set_cpu_affinity,ngx_setaffinity;
 
-提升进程优先级,这样这个进程就有机会被分配到更多的cpu时间（时间片【上下文切换】），得到执行的机会就会增多；
+- 提升进程优先级,这样这个进程就有机会被分配到更多的cpu时间（时间片【上下文切换】），得到执行的机会就会增多；
+
 setpriority()；
 
 干活时进程 处于R状态，没有连接连入时，进程处于S
 
-pidstat - w - p 3660 1 看某个进程的上下文切换次数[切换频率越低越好]
+pidstat - w - p 3660 1   看某个进程的上下文切换次数[切换频率越低越好]
 
-image-20220217201040281
+![image-20220217201040281](../images/202231-nginx整体框架解析/image-20220217201040281.png)
 
 cswch/s：主动切换/秒：你还有运行时间，但是因为你等东西，你把自己挂起来了，让出了自己时间片。
 
 nvcswch/s：被动切换/秒：时间片耗尽了，你必须要切出去；
 
-一个服务器程序，一般只放在一个计算机上跑,专用机；
-TCP / IP协议的配置选项
+- 一个服务器程序，一般只放在一个计算机上跑,专用机；
+
+#### TCP / IP协议的配置选项
+
 这些配置选项都有缺省值，通过修改，在某些场合下，对性能可能会有所提升；
 
 若要修改这些配置项，要求做到以下几点：
 
-对这个配置项有明确的理解；
-对相关的配置项,记录他的缺省值，做出修改；
-要反复不断的亲自测试，亲自验证；是否提升性能，是否有副作用；
-CP / IP协议的配置选项
-绑定cpu、提升进程优先级
-TCP / IP协议的配置选项
-TCP/IP协议额外注意的一些算法、概念等
-配置最大允许打开的文件句柄数
-cat /proc/sys/fs/file-max ：查看操作系统可以使用的最大句柄数
-cat /proc/sys/fs/file-nr ：查看当前已经分配的，分配了没使用的，文件句柄最大数目
+1. 对这个配置项有明确的理解；
+2. 对相关的配置项,记录他的缺省值，做出修改；
+3. 要反复不断的亲自测试，亲自验证；是否提升性能，是否有副作用；
 
+#### CP / IP协议的配置选项
+
+1. 绑定cpu、提升进程优先级
+2. TCP / IP协议的配置选项
+3. TCP/IP协议额外注意的一些算法、概念等
+
+#### 配置最大允许打开的文件句柄数
+
+cat /proc/sys/fs/file-max  ：查看操作系统可以使用的最大句柄数
+cat /proc/sys/fs/file-nr   ：查看当前已经分配的，分配了没使用的，文件句柄最大数目
+
+```bash
 fengyun@ubuntu:~/share/nginx$ sudo cat /proc/sys/fs/file-max
 9223372036854775807
 fengyun@ubuntu:~/share/nginx$ sudo cat /proc/sys/fs/file-nr
 7872	0	9223372036854775807
+```
+
 限制用户使用的最大句柄数
-/etc/security/limit.conf文件；
-root soft nofile 60000 :setrlimit(RLIMIT_NOFILE)
+ /etc/security/limit.conf文件；
+root soft nofile 60000  :setrlimit(RLIMIT_NOFILE)
 root hard nofile 60000
 
 ulimit -n ：查看系统允许的当前用户进程打开的文件数限制
-ulimit -HSn 5000 ：临时设置，只对当前session有效；
+ulimit -HSn 5000   ：临时设置，只对当前session有效；
 n:表示我们设置的是文件描述符
 推荐文章：https://blog.csdn.net/xyang81/article/details/52779229
 
-内存池补充说明
+### 内存池补充说明
+
 为什么没有用内存池技术：感觉必要性不大
 TCMalloc,取代malloc();
 库地址：https://github.com/gperftools/gperftools
