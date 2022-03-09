@@ -142,6 +142,7 @@ void CLogicSocket::threadRecvProcFunc(char *pMsgBuf)
     //(4)调用消息码对应的成员函数来处理
     (this->*statusHandler[imsgCode])(p_Conn,pMsgHeader,(char *)pPkgBody,pkglen-m_iLenPkgHeader);
     return;	
+
 }
 
 //心跳包检测时间到，该去检测心跳包是否超时的事宜，本函数是子类函数，实现具体的判断动作
@@ -163,8 +164,7 @@ void CLogicSocket::procPingTimeOutChecking(LPSTRUC_MSG_HEADER tmpmsg,time_t cur_
             //踢出去【如果此时此刻该用户正好断线，则这个socket可能立即被后续上来的连接复用  如果真有人这么倒霉，赶上这个点了，那么可能错踢，错踢就错踢】            
             //ngx_log_stderr(0,"时间到不发心跳包，踢出去!");   //感觉OK
             zdClosesocketProc(p_Conn); 
-        }   
-             
+        }                
         p_memory->FreeMemory(tmpmsg);//内存要释放
     }
     else //此连接断了
