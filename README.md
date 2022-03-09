@@ -1,16 +1,6 @@
----
-title: nginx整体框架解析
-date: 2022/3/1
-updated: 
-tags:
-  - nginx
-categories:
-  - webserver
-cover: /images/cover/nginx.jpg
+#基于nginx的简单webserver框架
 
----
-
-
+[TOC]
 
 
 
