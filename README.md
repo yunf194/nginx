@@ -1,6 +1,6 @@
 # 基于nginx的简单webserver框架
 
-[TOC]
+[原文链接]https://yunf194.github.io/2022/03/01/202231-nginx%E6%95%B4%E4%BD%93%E6%A1%86%E6%9E%B6%E8%A7%A3%E6%9E%90/
 
 
 
