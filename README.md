@@ -2,9 +2,278 @@
 
 [我的博客原文链接](https://yunf194.github.io/2022/03/01/202231-nginx%E6%95%B4%E4%BD%93%E6%A1%86%E6%9E%B6%E8%A7%A3%E6%9E%90/)
 
+基础架构设计
+
+master 负责管理 worker 进程，worker 进程负责处理网络事件。整个框架被设计为一种依赖事件驱动、异步、非阻塞的模式。
+
+如此设计的优点：
+
+- 1.可以充分利用多核机器，增强并发处理能力。
+- 2.多 worker 间可以实现负载均衡。
+- 3.Master 监控并统一管理 worker 行为。在 worker 异常后，可以主动拉起 worker 进程，从而提升了系统的可靠性。并且由 Master 进程控制服务运行中的程序升级、配置项修改等操作，从而增强了整体的动态可扩展与热更的能力。
+
+## main函数程序入口函数
+
+1. 一些全局变量的初始化包括读取配置文件（详见本文6.1读取配置文件）
+2. 单例类的初始化，包括CRC32校验类，专门分配内存和释放内存的类
+3. 日志初始化（详见[日志功能](https://yunf194.github.io/2022/01/29/2022129-日志功能/)）
+4. 信号初始化（详见[信号功能详解](https://yunf194.github.io/2022/01/24/信号/)）
+5. 环境变量搬家（详见本文6.2.1ngx_init_setproctitle）
+6. 创建守护进程ngx_daemon（详见[守护进程](https://yunf194.github.io/2022/01/25/2022125-%E5%AE%88%E6%8A%A4%E8%BF%9B%E7%A8%8B/)），最终以守护进程的形式运行着
+7. 进入正式的工作流程死循环ngx_master_process_cycle();
+8. 释放资源，虽然一般走不到这里，但是万一以后有需求呢？比较优雅的释放的方式
+
+```cpp
+//程序主入口函数----------------------------------
+int main(int argc, char *const *argv)
+{     
+    //printf("%u,%u,%u",EPOLLERR ,EPOLLHUP,EPOLLRDHUP);  
+    //exit(0);
+
+    int exitcode = 0;           //退出代码，先给0表示正常退出
+    int i;                      //临时用
+    
+    //(0)先初始化的变量
+    g_stopEvent = 0;            //标记程序是否退出，0不退出          
+
+    //(1)无伤大雅也不需要释放的放最上边    
+    ngx_pid    = getpid();      //取得进程pid
+    ngx_parent = getppid();     //取得父进程的id 
+    //统计argv所占的内存
+    g_argvneedmem = 0;
+    for(i = 0; i < argc; i++)  //argv =  ./nginx -a -b -c asdfas
+    {
+        g_argvneedmem += strlen(argv[i]) + 1; //+1是给\0留空间。
+    } 
+    //统计环境变量所占的内存。注意判断方法是environ[i]是否为空作为环境变量结束标记
+    for(i = 0; environ[i]; i++) 
+    {
+        g_envneedmem += strlen(environ[i]) + 1; //+1是因为末尾有\0,是占实际内存位置的，要算进来
+    } //end for
+
+    g_os_argc = argc;           //保存参数个数
+    g_os_argv = (char **) argv; //保存参数指针
+
+    //全局量有必要初始化的
+    ngx_log.fd = -1;                  //-1：表示日志文件尚未打开；因为后边ngx_log_stderr要用所以这里先给-1
+    ngx_process = NGX_PROCESS_MASTER; //先标记本进程是master进程
+    ngx_reap = 0;                     //标记子进程没有发生变化
+   
+    //(2)初始化失败，就要直接退出的
+    //配置文件必须最先要，后边初始化啥的都用，所以先把配置读出来，供后续使用 
+    CConfig *p_config = CConfig::GetInstance(); //单例类
+    if(p_config->Load("nginx.conf") == false) //把配置文件内容载入到内存            
+    {   
+        ngx_log_init();    //初始化日志
+        ngx_log_stderr(0,"配置文件[%s]载入失败，退出!","nginx.conf");
+        //exit(1);终止进程，在main中出现和return效果一样 ,exit(0)表示程序正常, exit(1)/exit(-1)表示程序异常退出，exit(2)表示表示系统找不到指定的文件
+        exitcode = 2; //标记找不到文件
+        goto lblexit;
+    }
+    //(2.1)内存单例类可以在这里初始化，返回值不用保存
+    CMemory::GetInstance();	
+    //(2.2)crc32校验算法单例类可以在这里初始化，返回值不用保存
+    CCRC32::GetInstance();
+        
+    //(3)一些必须事先准备好的资源，先初始化
+    ngx_log_init();             //日志初始化(创建/打开日志文件)，这个需要配置项，所以必须放配置文件载入的后边；     
+        
+    //(4)一些初始化函数，准备放这里        
+    if(ngx_init_signals() != 0) //信号初始化
+    {
+        exitcode = 1;
+        goto lblexit;
+    }        
+    if(g_socket.Initialize() == false)//初始化socket,bind(),listen()
+    {
+        exitcode = 1;
+        goto lblexit;
+    }
+
+    //(5)一些不好归类的其他类别的代码，准备放这里
+    ngx_init_setproctitle();    //把环境变量搬家
+
+    //------------------------------------
+    //(6)创建守护进程
+    if(p_config->GetIntDefault("Daemon",0) == 1) //读配置文件，拿到配置文件中是否按守护进程方式启动的选项
+    {
+        //1：按守护进程方式运行
+        int cdaemonresult = ngx_daemon();
+        if(cdaemonresult == -1) //fork()失败
+        {
+            exitcode = 1;    //标记失败
+            goto lblexit;
+        }
+        if(cdaemonresult == 1)
+        {
+            //这是原始的父进程
+            freeresource();   //只有进程退出了才goto到 lblexit，用于提醒用户进程退出了
+                              //而我现在这个情况属于正常fork()守护进程后的正常退出，不应该跑到lblexit()去执行，因为那里有一条打印语句标记整个进程的退出，这里不该限制该条打印语句；
+            exitcode = 0;
+            return exitcode;  //整个进程直接在这里退出
+        }
+        //走到这里，成功创建了守护进程并且这里已经是fork()出来的进程，现在这个进程做了master进程
+        g_daemonized = 1;    //守护进程标记，标记是否启用了守护进程模式，0：未启用，1：启用了
+    }
+
+    //(7)开始正式的主工作流程，主流程一致在下边这个函数里循环，暂时不会走下来，资源释放啥的日后再慢慢完善和考虑    
+    ngx_master_process_cycle(); //不管父进程还是子进程，正常工作期间都在这个函数里循环；
+        
+    //--------------------------------------------------------------    
+    //for(;;)    
+    //{
+    //    sleep(1); //休息1秒        
+    //    printf("休息1秒\n");        
+    //}
+      
+    //--------------------------------------
+lblexit:
+    //(5)该释放的资源要释放掉
+    ngx_log_stderr(0,"程序退出，再见了!");
+    freeresource();  //一系列的main返回前的释放动作函数
+    //printf("程序退出，再见!\n");    
+    return exitcode;
+}
+```
+
+## master进程工作
+
+### ngx_master_process_cycle（master进程）
+
+1. 信号集初始化并且调用sigaddset防止10个信号的干扰
+2. 当master把该做的事情（设置主进程标题ngx_setproctitle和创建子进程ngx_start_worker_processes）做完了就会进入一个**死循环for**
+3. for里面调用`sigsuspend(&set);`进程是挂起的，**不占用cpu时间**，**只有收到信号才会被唤醒**，主进程只依靠信号来驱动
+
+sigsuspend是一个**原子操作**，包含4个步骤：
+
+1. 根据给定的参数设置新的mask 并 **阻塞当前进程**【因为是个空集，所以不阻塞任何信号】
+2. 此时，**一旦收到信号，便恢复原先的信号屏蔽**【我们原来调用sigprocmask()的mask在上边设置的，阻塞了多达10个信号，从而保证我下边的执行流程不会再次被其他信号截断】
+3. 调用该信号对应的**信号处理函数**
+4. 信号处理函数返回后，sigsuspend返回，**使程序流程继续往下走**
+
+```cpp
+//描述：创建worker子进程
+void ngx_master_process_cycle()
+{    
+    sigset_t set;        //信号集
+
+    sigemptyset(&set);   //清空信号集
+
+    //下列这些信号在执行本函数期间不希望收到【考虑到官方nginx中有这些信号，就都搬过来了】（保护不希望由信号中断的代码临界区）
+    //建议fork()子进程时学习这种写法，防止信号的干扰；
+    sigaddset(&set, SIGCHLD);     //子进程状态改变
+    sigaddset(&set, SIGALRM);     //定时器超时
+    sigaddset(&set, SIGIO);       //异步I/O
+    sigaddset(&set, SIGINT);      //终端中断符
+    sigaddset(&set, SIGHUP);      //连接断开
+    sigaddset(&set, SIGUSR1);     //用户定义信号
+    sigaddset(&set, SIGUSR2);     //用户定义信号
+    sigaddset(&set, SIGWINCH);    //终端窗口大小改变
+    sigaddset(&set, SIGTERM);     //终止
+    sigaddset(&set, SIGQUIT);     //终端退出符
+    //.........可以根据开发的实际需要往其中添加其他要屏蔽的信号......
+    
+    //设置，此时无法接受的信号；阻塞期间，你发过来的上述信号，多个会被合并为一个，暂存着，等你放开信号屏蔽后才能收到这些信号。。。
+    if (sigprocmask(SIG_BLOCK, &set, NULL) == -1) //第一个参数用了SIG_BLOCK表明设置 进程 新的信号屏蔽字 为 “当前信号屏蔽字 和 第二个参数指向的信号集的并集
+    {        
+        ngx_log_error_core(NGX_LOG_ALERT,errno,"ngx_master_process_cycle()中sigprocmask()失败!");
+    }
+    //即便sigprocmask失败，程序流程 也继续往下走
+
+    //首先我设置主进程标题---------begin
+    size_t size;
+    int    i;
+    size = sizeof(master_process);  //注意我这里用的是sizeof，所以字符串末尾的\0是被计算进来了的
+    size += g_argvneedmem;          //argv参数长度加进来    
+    if(size < 1000) //长度小于这个，我才设置标题
+    {
+        char title[1000] = {0};
+        strcpy(title,(const char *)master_process); //"master process"
+        strcat(title," ");  //跟一个空格分开一些，清晰    //"master process "
+        for (i = 0; i < g_os_argc; i++)         //"master process ./nginx"
+        {
+            strcat(title,g_os_argv[i]);
+        }//end for
+        ngx_setproctitle(title); //设置标题
+        ngx_log_error_core(NGX_LOG_NOTICE,0,"%s %P 【master进程】启动并开始运行......!",title,ngx_pid); //设置标题时顺便记录下来进程名，进程id等信息到日志
+    }    
+    //首先我设置主进程标题---------end
+        
+    //从配置文件中读取要创建的worker进程数量
+    CConfig *p_config = CConfig::GetInstance(); //单例类
+    int workprocess = p_config->GetIntDefault("WorkerProcesses",1); //从配置文件中得到要创建的worker进程数量
+    ngx_start_worker_processes(workprocess);  //这里要创建worker子进程
+
+    //创建子进程后，父进程的执行流程会返回到这里，子进程不会走进来    
+    sigemptyset(&set); //信号屏蔽字为空，表示不屏蔽任何信号，但以往阻塞的信号仍然被阻塞，需要sigprocmask来解除阻塞
+    
+    for ( ;; ) 
+    {
+
+    //    usleep(100000);
+        //ngx_log_error_core(0,0,"haha--这是父进程，pid为%P",ngx_pid);
+
+        // sigsuspend(const sigset_t *mask))用于在接收到某个信号之前, 临时用mask替换进程的信号掩码, 并暂停进程执行，直到收到信号为止。
+        // sigsuspend 返回后将恢复调用之前的信号掩码。信号处理函数完成后，进程将继续执行。该系统调用始终返回-1，并将errno设置为EINTR。
+
+        //sigsuspend是一个原子操作，包含4个步骤：
+        //a)根据给定的参数设置新的mask 并 阻塞当前进程【因为是个空集，所以不阻塞任何信号】
+        //b)此时，一旦收到信号，便恢复原先的信号屏蔽【我们原来调用sigprocmask()的mask在上边设置的，阻塞了多达10个信号，从而保证我下边的执行流程不会再次被其他信号截断】
+        //c)调用该信号对应的信号处理函数
+        //d)信号处理函数返回后，sigsuspend返回，使程序流程继续往下走
+        //printf("for进来了！\n"); //发现，如果print不加\n，无法及时显示到屏幕上，是行缓存问题，以往没注意；可参考https://blog.csdn.net/qq_26093511/article/details/53255970
+
+        sigsuspend(&set); //阻塞在这里，等待一个信号，此时进程是挂起的，不占用cpu时间，只有收到信号才会被唤醒（返回）；
+                         //此时master进程完全靠信号驱动干活    
+
+//        printf("执行到sigsuspend()下边来了\n");
+        
+        //printf("master进程休息1秒\n");      
+        //ngx_log_stderr(0,"haha--这是父进程，pid为%P",ngx_pid); 
+        sleep(1); //休息1秒        
+        //以后扩充.......
+
+    }// end for(;;)
+    return;
+}
+```
+
+### ngx_spawn_process（master进程创建子进程）
+
+```cpp
+//pprocname：子进程名字"worker process"
+static int ngx_spawn_process(int inum,const char *pprocname)
+{
+    pid_t  pid;
+
+    pid = fork(); //fork()系统调用产生子进程
+    switch (pid)  //pid判断父子进程，分支处理
+    {  
+    case -1: //产生子进程失败
+        ngx_log_error_core(NGX_LOG_ALERT,errno,"ngx_spawn_process()fork()产生子进程num=%d,procname=\"%s\"失败!",inum,pprocname);
+        return -1;
+
+    case 0:  //子进程分支
+        ngx_parent = ngx_pid;              //因为是子进程了，所有原来的pid变成了父pid
+        ngx_pid = getpid();                //重新获取pid,即本子进程的pid
+        ngx_worker_process_cycle(inum,pprocname);    //我希望所有worker子进程，在这个函数里不断循环着不出来，也就是说，子进程流程不往下边走;
+        break;
+
+    default: //这个应该是父进程分支，直接break;，流程往switch之后走            
+        break;
+    }//end switch
+
+    //父进程分支会走到这里，子进程流程不往下边走-------------------------
+    //若有需要，以后再扩展增加其他代码......
+    return pid;
+}
+```
 
 
-## master进程创建监听端口并且初始化
+
+### ngx_open_listening_sockets监听端口并且初始化（worker）
+
+> NGINX官方socket()和bind()，listen()创建一个监听套接字是在master进程，子进程中调用accept()，**这也是我先前的作法，但是这样会造成惊群现象**，官方解决方法是加一把锁，但是这个方法并不是那么妥当，我选择了在worker中创建不同的监听套接字以避免惊群现象，详情原因见本文末的惊群
 
 1.对于创建的每个要监听的端口都要创建1个socket，ipv4，任意地址，所有网卡设定。
 
@@ -16,7 +285,7 @@
 
 5.将各个监听的isock（目前为2个）放入监听套接字队列CSocekt::vector<lpngx_listening_t> m_ListenSocketList; 
 
-注意：这是在主进程中创建监听端口(主进程执行这个函数)，一旦后续fork()出来四个子进程，五个进程都在监听80和443两个端口。
+注意：~~这是在主进程中创建监听端口(主进程执行这个函数)~~，一旦后续fork()出来四个子进程，五个进程都在监听80和443两个端口。
 
 ```cpp
 //监听端口【支持多个端口】，这里遵从nginx的函数命名
@@ -123,19 +392,150 @@ bool CSocekt::ngx_open_listening_sockets()
 }
 ```
 
+## worker进程初始化工作
+
+### ngx_worker_process_init
+
+1.放开信号集屏蔽
+
+2.创建线程池中的线程g_threadpool.create详见本文后续内容，这些线程是用于处理消息队列里的消息的，等到消息队列有消息的时候，主线程会唤醒他们。
+
+3.Initialize_subproc初始化发消息互斥量，连接互斥量，连接回收队列相关互斥量、时间处理队列互斥量，初始化发消息的信号量等以及创建1个发送数据的线程，1个回收连接的线程，1个处理到期不发心跳包的线程。（以及在这里创建监听端口）
+
+4.ngx_epoll_init();初始化epoll相关内容，同时 往监听socket上增加监听事件，从而开始让监听端口履行其职责
+
+```cpp
+//描述：子进程创建时调用本函数进行一些初始化工作
+static void ngx_worker_process_init(int inum)
+{
+    sigset_t  set;      //信号集
+
+    sigemptyset(&set);  //清空信号集
+    if (sigprocmask(SIG_SETMASK, &set, NULL) == -1)  //原来是屏蔽那10个信号【防止fork()期间收到信号导致混乱】，现在不再屏蔽任何信号【接收任何信号】
+    {
+        ngx_log_error_core(NGX_LOG_ALERT,errno,"ngx_worker_process_init()中sigprocmask()失败!");
+    }
+
+    //线程池代码，率先创建，至少要比和socket相关的内容优先
+    CConfig *p_config = CConfig::GetInstance();
+    int tmpthreadnums = p_config->GetIntDefault("ProcMsgRecvWorkThreadCount",5); //处理接收到的消息的线程池中线程数量
+    if(g_threadpool.Create(tmpthreadnums) == false)  //创建线程池中线程
+    {
+        //内存没释放，但是简单粗暴退出;
+        exit(-2);
+    }
+    sleep(1); //再休息1秒;
+
+    if(g_socket.Initialize_subproc() == false) //初始化子进程需要具备的一些多线程能力相关的信息
+    {
+        //内存没释放，但是简单粗暴退出；
+        exit(-2);
+    }
+    
+    //如下这些代码参照官方nginx里的ngx_event_process_init()函数中的代码
+    g_socket.ngx_epoll_init();           //初始化epoll相关内容，同时 往监听socket上增加监听事件，从而开始让监听端口履行其职责
+    //g_socket.ngx_epoll_listenportstart();//往监听socket上增加监听事件，从而开始让监听端口履行其职责【如果不加这行，虽然端口能连上，但不会触发ngx_epoll_process_events()里边的epoll_wait()往下走】
+    
+    
+    //....将来再扩充代码
+    //....
+    return;
+}
+```
+
+### Initialize_subproc子进程中才需要执行的初始化函数
+
+```cpp
+//子进程中才需要执行的初始化函数
+bool CSocekt::Initialize_subproc()
+{
+    if(ngx_open_listening_sockets() == false)  //打开监听端口    
+    return false;  
+    //发消息互斥量初始化
+    if(pthread_mutex_init(&m_sendMessageQueueMutex, NULL)  != 0)
+    {        
+        ngx_log_stderr(0,"CSocekt::Initialize_subproc()中pthread_mutex_init(&m_sendMessageQueueMutex)失败.");
+        return false;    
+    }
+    //连接相关互斥量初始化
+    if(pthread_mutex_init(&m_connectionMutex, NULL)  != 0)
+    {
+        ngx_log_stderr(0,"CSocekt::Initialize_subproc()中pthread_mutex_init(&m_connectionMutex)失败.");
+        return false;    
+    }    
+    //连接回收队列相关互斥量初始化
+    if(pthread_mutex_init(&m_recyconnqueueMutex, NULL)  != 0)
+    {
+        ngx_log_stderr(0,"CSocekt::Initialize_subproc()中pthread_mutex_init(&m_recyconnqueueMutex)失败.");
+        return false;    
+    } 
+    //和时间处理队列有关的互斥量初始化
+    if(pthread_mutex_init(&m_timequeueMutex, NULL)  != 0)
+    {
+        ngx_log_stderr(0,"CSocekt::Initialize_subproc()中pthread_mutex_init(&m_timequeueMutex)失败.");
+        return false;    
+    }
+   
+    //初始化发消息相关信号量，信号量用于进程/线程 之间的同步，虽然 互斥量[pthread_mutex_lock]和 条件变量[pthread_cond_wait]都是线程之间的同步手段，但
+    //这里用信号量实现 则 更容易理解，更容易简化问题，使用书写的代码短小且清晰；
+    //第二个参数=0，表示信号量在线程之间共享，确实如此 ，如果非0，表示在进程之间共享
+    //第三个参数=0，表示信号量的初始值，为0时，调用sem_wait()就会卡在那里卡着
+    if(sem_init(&m_semEventSendQueue,0,0) == -1)
+    {
+        ngx_log_stderr(0,"CSocekt::Initialize_subproc()中sem_init(&m_semEventSendQueue,0,0)失败.");
+        return false;
+    }
+
+    //创建线程
+    int err;
+    ThreadItem *pSendQueue;    //专门用来发送数据的线程
+    m_threadVector.push_back(pSendQueue = new ThreadItem(this));                         //创建 一个新线程对象 并入到容器中 
+    err = pthread_create(&pSendQueue->_Handle, NULL, ServerSendQueueThread,pSendQueue); //创建线程，错误不返回到errno，一般返回错误码
+    if(err != 0)
+    {
+        ngx_log_stderr(0,"CSocekt::Initialize_subproc()中pthread_create(ServerSendQueueThread)失败.");
+        return false;
+    }
+
+    //---
+    ThreadItem *pRecyconn;    //专门用来回收连接的线程
+    m_threadVector.push_back(pRecyconn = new ThreadItem(this)); 
+    err = pthread_create(&pRecyconn->_Handle, NULL, ServerRecyConnectionThread,pRecyconn);
+    if(err != 0)
+    {
+        ngx_log_stderr(0,"CSocekt::Initialize_subproc()中pthread_create(ServerRecyConnectionThread)失败.");
+        return false;
+    }
+
+    if(m_ifkickTimeCount == 1)  //是否开启踢人时钟，1：开启   0：不开启
+    {
+        ThreadItem *pTimemonitor;    //专门用来处理到期不发心跳包的用户踢出的线程
+        m_threadVector.push_back(pTimemonitor = new ThreadItem(this)); 
+        err = pthread_create(&pTimemonitor->_Handle, NULL, ServerTimerQueueMonitorThread,pTimemonitor);
+        if(err != 0)
+        {
+            ngx_log_stderr(0,"CSocekt::Initialize_subproc()中pthread_create(ServerTimerQueueMonitorThread)失败.");
+            return false;
+        }
+    }
+
+    return true;
+}
+```
+
 ### ngx_epoll_init
 
-创建监听端口是在父进程中（ngx_open_listening_sockets）进行的，那么完整的初始化监听socket（包括创建连接池并且将每个监听socket放入到连接池的连接和放入epoll红黑树开始监听事件）是在子进程
+创建监听端口是在~~父进程~~（子进程）中（ngx_open_listening_sockets）进行的，那么完整的初始化监听socket（包括创建连接池并且将每个监听socket放入到连接池的连接和放入epoll红黑树开始监听事件）是在子进程
 
 1.在这里创建一个epoll对象，一定要判断返回值，这是一个好习惯
 
-2.创建连接池
+2.创建连接池，详见本文后续内容连接池
 
 3.每个监听socket增加一个 连接池中的连接，同时连接池内的连接（只有是监听socket的连接才可以）也可以通过`lpngx_connection_t::p_Conn->listening = (*pos);`找到监听socket对象。
 
-4.连接池内的连接用`p_Conn->rhandler = &CSocekt::ngx_event_accept;`将读事件的相关处理方法设置为`ngx_event_accept()`函数。
+4.设置连接池内的监听socket的写事件处理函数为`p_Conn->rhandler = &CSocekt::ngx_event_accept;`，此函数用于处理三次握手事件，对于三次握手的新连接又会重新指定写事件处理函数和读事件处理函数
 
-5.监听socket上增加(EPOLL_CTL_ADD)监听的事件，读事件和TCP连接关闭即对应`EPOLLIN|EPOLLRDHUP`事件，
+5.为**每一个监听socket**上增加(EPOLL_CTL_ADD)监听的事件，读事件和TCP连接半关闭分别对应`EPOLLIN|EPOLLRDHUP`事件
 
 ```cpp
 //(1)epoll功能初始化，子进程中进行 ，本函数被ngx_worker_process_init()所调用
@@ -191,8 +591,6 @@ int CSocekt::ngx_epoll_init()
 }
 ```
 
-
-
 ### ngx_close_connection直接关闭连接
 
 ```cpp
@@ -211,9 +609,7 @@ void CSocekt::ngx_close_connection(lpngx_connection_t pConn)
 }
 ```
 
-
-
-### ngx_epoll_oper_event对epoll事件的具体操作
+### ngx_epoll_oper_event对epoll事件的具体操作（增删改）
 
 - 三次握手进来增加读事件ADD
 - 监听端口有ADD
@@ -296,15 +692,14 @@ int CSocekt::ngx_epoll_oper_event(
 
 3.然后for循环里不断地通过m_events[i].data.ptr把发生了事件的**连接池中的连接**取出来并且`revents = m_events[i].events;`取出**这个连接的事件类型**
 
-4.判断事件类型，
+4.对于**每一个发生事件的连接**判断发生事件的类型，
 	对于读事件，`(this->* (p_Conn->rhandler) )(p_Conn);`函数指针
 	对于监听套接字的连接会调用`CSocekt::ngx_event_accept(c)`，这在子进程创建时进行初始化ngx_epoll_init函数中就已经将连接池内的监听套接字连接的函数指针指定到ngx_event_accept上
 	如果是已经连入，发送数据到这里，则这里执行的应该是 `CSocekt::ngx_read_request_handler()`
-5.判断事件类型，对于写事件
 
-![image-20220308120234266](../images/202231-nginx整体框架解析/image-20220308120234266.png)
+![image-20220312210127527](../images/202231-nginx整体框架解析/image-20220312210127527.png)
 
-注意我这个ngx_epoll_process_events中epoll_wait相当于事件收集器，各个事件对应的处理函数都属于事件处理器，用来消费事件。因此每个处理函数不能够被阻塞，而且应该尽快执行完成，否则整个for死循环中的ngx_epoll_process_events卡住了，下一次epoll_wait函数积累的事件越来越多整个程序就会崩盘了。
+注意我这个ngx_epoll_process_events中epoll_wait相当于事件收集器，各个事件对应的处理函数都属于事件处理器，用来消费事件。**因此每个处理函数不能够被阻塞，而且应该尽快执行完成**，否则整个for死循环中的ngx_epoll_process_events卡住了，下一次epoll_wait函数积累的事件越来越多整个程序就会崩盘了。
 
 ```cpp
 //开始获取发生的事件消息
@@ -1019,7 +1414,7 @@ send()【Windows端】,write()【linux】发送数据时，实际上这两个函
 
 如果服务器端的发送 缓冲区满了，那么服务器再调用send(),write()发送数据的时候，那么send(),write()函数就会返回一个EAGAIN；；EAGAIN不是一个错误，只是示意发送缓冲区已经满了，迟一些再调用send(),write()来发送数据吧；
 
-针对 当socket可写的时候【发送缓冲区没满】，会不停的触发socket可写事件 ,我们提出两种解决方案【面试可能考试】；
+针对 当socket可写的时候【发送缓冲区没满】，会不停的触发socket可写事件 ,我们提出两种解决方案【重要】；
 
 两种解决方案，来自网络,意义在于我们可以通过这种解决方案来指导我们写代码；
 
@@ -1415,6 +1810,70 @@ void CSocekt::ngx_write_request_handler(lpngx_connection_t pConn)
 ```
 
 ## 连接池
+
+### 连接池类
+
+```cpp
+//以下三个结构是非常重要的三个结构，我们遵从官方nginx的写法；
+//(1)该结构表示一个TCP连接【客户端主动发起的、Nginx服务器被动接受的TCP连接】
+struct ngx_connection_s
+{		
+	ngx_connection_s();                                      //构造函数
+	virtual ~ngx_connection_s();                             //析构函数
+	void GetOneToUse();                                      //分配出去的时候初始化一些内容
+	void PutOneToFree();                                     //回收回来的时候做一些事情
+
+
+	int                       fd;                            //套接字句柄socket
+	lpngx_listening_t         listening;                     //如果这个链接被分配给了一个监听套接字，那么这个里边就指向监听套接字对应的那个lpngx_listening_t的内存首地址		
+
+	//------------------------------------	
+	//unsigned                  instance:1;                    //【位域】失效标志位：0：有效，1：失效【这个是官方nginx提供，到底有什么用，ngx_epoll_process_events()中详解】  
+	uint64_t                  iCurrsequence;                 //我引入的一个序号，每次分配出去时+1，此法也有可能在一定程度上检测错包废包，具体怎么用，用到了再说
+	struct sockaddr           s_sockaddr;                    //保存对方地址信息用的
+	//char                      addr_text[100]; //地址的文本信息，100足够，一般其实如果是ipv4地址，255.255.255.255，其实只需要20字节就够
+
+	//和读有关的标志-----------------------
+	//uint8_t                   r_ready;        //读准备好标记【暂时没闹明白官方要怎么用，所以先注释掉】
+	//uint8_t                   w_ready;        //写准备好标记
+
+	ngx_event_handler_pt      rhandler;                       //读事件的相关处理方法
+	ngx_event_handler_pt      whandler;                       //写事件的相关处理方法
+
+	//和epoll事件有关
+	uint32_t                  events;                         //和epoll事件有关  
+	
+	//和收包有关
+	unsigned char             curStat;                        //当前收包的状态
+	char                      dataHeadInfo[_DATA_BUFSIZE_];   //用于保存收到的数据的包头信息			
+	char                      *precvbuf;                      //接收数据的缓冲区的头指针，对收到不全的包非常有用，看具体应用的代码
+	unsigned int              irecvlen;                       //要收到多少数据，由这个变量指定，和precvbuf配套使用，看具体应用的代码
+	char                      *precvMemPointer;               //new出来的用于收包的内存首地址，释放用的
+
+	pthread_mutex_t           logicPorcMutex;                 //逻辑处理相关的互斥量      
+
+	//和发包有关
+	std::atomic<int>          iThrowsendCount;                //发送消息，如果发送缓冲区满了，则需要通过epoll事件来驱动消息的继续发送，所以如果发送缓冲区满，则用这个变量标记
+	char                      *psendMemPointer;               //发送完成后释放用的，整个数据的头指针，其实是 消息头 + 包头 + 包体
+	char                      *psendbuf;                      //发送数据的缓冲区的头指针，开始 其实是包头+包体
+	unsigned int              isendlen;                       //要发送多少数据
+
+	//和回收有关
+	time_t                    inRecyTime;                     //入到资源回收站里去的时间
+
+	//和心跳包有关
+	time_t                    lastPingTime;                   //上次ping的时间【上次发送心跳包的事件】
+
+	//和网络安全有关	
+	uint64_t                  FloodkickLastTime;              //Flood攻击上次收到包的时间
+	int                       FloodAttackCount;               //Flood攻击在该时间内收到包的次数统计
+	std::atomic<int>          iSendCount;                     //发送队列中有的数据条目数，若client只发不收，则可能造成此数过大，依据此数做出踢出处理 
+	
+
+	//--------------------------------------------------
+	lpngx_connection_t        next;                           //这是个指针，指向下一个本类型对象，用于把空闲的连接池对象串起来构成一个单向链表，方便取用
+};
+```
 
 ### initconnection初始化连接池
 
@@ -2134,187 +2593,9 @@ void CThreadPool::StopAll()
 }
 ```
 
-### 
-
-```cpp
-//将一个待发送消息入到发消息队列中
-void CSocekt::msgSend(char *psendbuf) 
-    上锁m_sendMessageQueueMutex
-    判断当前TCP连接的发送消息队列m_iSendMsgQueueCount大小
-    	过大：丢包并直接return
-    判断当前TCP连接的发送消息队列iSendCount大小
-    	过大：直接关闭连接并返回
-    
-    m_MsgSendQueue.push_back(psendbuf);//放入发送消息队列
-    sem_post(&m_semEventSendQueue)//信号量加一，让ServerSendQueueThread()流程走下来干活
-    
-```
-
-
-
-```cpp
-//处理发送消息队列的线程
-void* CSocekt::ServerSendQueueThread(void* threadData)
-    while(程序不退出)
-        sem_wait(&pSocketObj->m_semEventSendQueue)//本线程卡在这里，等待msgSend函数唤醒
-        pthread_mutex_lock(m_sendMessageQueueMutex);//加锁
-		while(pos != posend)//遍历消息队列
-            p_Conn = pMsgHeader->pConn;//取出当前TCP连接的指针
-            判断是否消息过期
-                是：从队列中移除并且continue
-            发送缓冲区是否满？
-                是：continue
-           
-            sendproc()//终于开始发数据了 
-            if(一下子数据全发出去了)释放内存
-            else (没有全部发送完毕 EAGAIN )//肯定是因为 发送缓冲区满了
-                ngx_epoll_oper_event//依靠epoll驱动调用ngx_write_request_handler()函数发送数据
-            else(一个字节都没发)
-                ngx_epoll_oper_event//也是依靠epoll驱动
-            else //对端断开了
-        end while(pos != posend)
-        解锁
-	end while(程序不退出)
- 	return;
-```
-
-
-
-```cpp
-
-```
-
-
-
-```cpp
-//设置数据发送时的写处理函数,当数据可写时epoll通知我们，我们在 int CSocekt::ngx_epoll_process_events(int timer)  中调用此函数
-//在 int CSocekt::ngx_epoll_process_events(int timer)  中epoll_wait阻塞了
-//能走到这里，数据就是没法送完毕，要继续发送
-void CSocekt::ngx_write_request_handler(lpngx_connection_t pConn)
-    sendsize = sendproc(pConn,pConn->psendbuf,pConn->isendlen);//发消息
-	if(sendsize > 0 && sendsize != pConn->isendlen)//没有全部发完
-        return;//返回，等待epoll_wait再次唤醒这个函数继续发送
-	
-	if(sendsize > 0 && sendsize == pConn->isendlen) //成功发送完毕，做个通知是可以的；
-		ngx_epoll_oper_event//把写事件通知从epoll中干掉
-        
-    sem_post(&m_semEventSendQueue)//信号量加一，让ServerSendQueueThread()流程走下来干活
-```
-
-
-
-```cpp
-//来数据时候的处理，当连接上有数据来的时候，本函数会被ngx_epoll_process_events()所调用  ,官方的类似函数为ngx_http_wait_request_handler();
-void CSocekt::ngx_read_request_handler(lpngx_connection_t pConn)
-    ssize_t reco = recvproc(pConn,pConn->precvbuf,pConn->irecvlen); //收取数据
-    if(reco <= 0) return;
-    ngx_wait_request_handler_proc_p1(pConn,isflood); //那就调用专门针对包头处理完整的函数去处理把。
-    ngx_wait_request_handler_proc_plast(pConn,isflood);//包体处理函数
-		g_threadpool.inMsgRecvQueueAndSignal(pConn->precvMemPointer); //入消息队列并触发线程处理消息
-	
-    
-```
-
-
-
-```cpp
-//收到一个完整消息后，入消息队列，并触发线程池中线程来处理该消息
-void CThreadPool::inMsgRecvQueueAndSignal(char *buf)
-{
-    pthread_mutex_lock(&m_pthreadMutex);上锁
-    m_MsgRecvQueue.push_back(buf);	         //入消息队列
-    pthread_mutex_unlock(&m_pthreadMutex);解锁
-    //可以激发一个线程来干活了
-    Call();
-    return;
-}
-```
-
-
-
-```cpp
-//来任务了，调一个线程池中的线程下来干活
-void CThreadPool::Call()
-{
-    pthread_cond_signal(&m_pthreadCond); //唤醒一个等待该条件的线程，也就是可以唤醒卡在pthread_cond_wait()的线程
-    if(m_iThreadNum == m_iRunningThreadNum) //线程池中线程总量，跟当前正在干活的线程数量一样，说明所有线程都忙碌起
-            ngx_log_stderr(0,"CThreadPool::Call()中发现线程池中当前空闲线程数量为0，要考虑扩容线程池了!");
-    return;
-}
-```
-
-
-
-
-
-```cpp
-//处理连接回收的线程
-void* CSocekt::ServerRecyConnectionThread(void* threadData)
-    while(1)
-        usleep(200 * 1000);//睡眠200毫秒
-		pthread_mutex_lock(&pSocketObj->m_recyconnqueueMutex);上锁
-        for(; pos != posend; ++pos)
-            if(进入回收站时间+等待回收时间>当前时间)continue;//未到释放时间
-			m_recyconnectionList.erase(pos);//将释放连接容器里的连接释放
-			connection(p_Conn);////归还参数pConn所代表的连接到到连接池中
-		解锁
-        if(g_stopEvent == 1) //要退出整个程序，那么肯定要先退出这个循环
-        做上面的相同行为而且不加时间判断，对所有连接全回收
-	endwhile(1)   
-        
-```
-
-
-
-```cpp
-//归还参数pConn所代表的连接到到连接池中，注意参数类型是lpngx_connection_t
-void CSocekt::ngx_free_connection(lpngx_connection_t pConn) 
-{
-    //因为有线程可能要动连接池中连接，所以在合理互斥也是必要的
-    CLock lock(&m_connectionMutex);  
-
-    //首先明确一点，连接，所有连接全部都在m_connectionList里；
-    pConn->PutOneToFree();
-
-    //扔到空闲连接列表里
-    m_freeconnectionList.push_back(pConn);
-
-    //空闲连接数+1
-    ++m_free_connection_n;
-
-    return;
-}
-//
-	std::list<lpngx_connection_t>  m_connectionList;                      //连接列表【连接池】
-	std::list<lpngx_connection_t>  m_freeconnectionList;                  //空闲连接列表【这里边装的全是空闲的
-	std::list<lpngx_connection_t>  m_recyconnectionList;                  //将要释放的连接放这里
-```
-
-
-
-```cpp
-//回收回来一个连接的时候做一些事
-void ngx_connection_s::PutOneToFree()
-{
-    ++iCurrsequence;   
-    if(precvMemPointer != NULL)//我们曾经给这个连接分配过接收数据的内存，则要释放内存
-    {        
-        CMemory::GetInstance()->FreeMemory(precvMemPointer);
-        precvMemPointer = NULL;        
-    }
-    if(psendMemPointer != NULL) //如果发送数据的缓冲区里有内容，则要释放内存
-    {
-        CMemory::GetInstance()->FreeMemory(psendMemPointer);
-        psendMemPointer = NULL;
-    }
-
-    iThrowsendCount = 0;                              //设置不设置感觉都行         
-}
-```
-
 ## 业务逻辑
 
-线程池里面地线程都“嗷嗷待哺”地等待客户端发来消息，线程池地线程都会执行threadRecvProcFunc函数，这个函数会根据发来的消息包的不同执行不同的逻辑函数。
+线程池里面地线程都“嗷嗷待哺”地等待客户端发来消息，线程池地线程都会执行threadRecvProcFunc函数，这个函数会根据发来的消息包的不同执行不同的逻辑函数。目前逻辑并不多，只处理了一个心跳包的逻辑。
 
 ### 心跳包
 
@@ -2555,7 +2836,234 @@ lblMTQM:
 }
 ```
 
+## 其他模块
 
+### 读取配置文件
+
+```conf
+#是注释行，
+#每个有效配置项用 等号 处理，等号前不超过40个字符，等号后不超过400个字符；
+
+ 
+#[开头的表示组信息，也等价于注释行
+#[Socket]
+#ListenPort = 5678    
+#DBInfo = 127.0.0.1;1234;myr;123456;mxdb_g
+
+#日志相关
+[Log]
+#日志文件输出目录和文件名
+#Log=logs/error.log
+Log=error.log
+
+#只打印日志等级<= 数字 的日志到日志文件中 ，日志等级0-8,0级别最高，8级别最低。
+LogLevel = 8
+
+#进程相关
+[Proc]
+#创建 这些个 worker进程
+WorkerProcesses = 4
+
+#是否按守护进程方式运行，1：按守护进程方式运行，0：不按守护进程方式运行
+Daemon = 1
+
+#处理接收到的消息的线程池中线程数量，不建议超过300
+ProcMsgRecvWorkThreadCount = 120
+
+#和网络相关
+[Net]
+#监听的端口数量，一般都是1个，当然如果支持多于一个也是可以的
+ListenPortCount = 1
+#ListenPort+数字【数字从0开始】，这种ListenPort开头的项有几个，取决于ListenPortCount的数量，
+ListenPort0 = 80
+#ListenPort1 = 443
+
+#epoll连接的最大数【是每个worker进程允许连接的客户端数】，实际其中有一些连接要被监听socket使用，实际允许的客户端连接数会比这个数小一些
+worker_connections = 2048
+
+#Sock_RecyConnectionWaitTime:为确保系统稳定socket关闭后资源不会立即收回，而要等一定的秒数，在这个秒数之后，才进行资源/连接的回收
+Sock_RecyConnectionWaitTime = 150
+
+#Sock_WaitTimeEnable：是否开启踢人时钟，1：开启   0：不开启
+Sock_WaitTimeEnable = 1
+#多少秒检测一次是否 心跳超时，只有当Sock_WaitTimeEnable = 1时，本项才有用
+Sock_MaxWaitTime = 20
+#当时间到达Sock_MaxWaitTime指定的时间时，直接把客户端踢出去，只有当Sock_WaitTimeEnable = 1时，本项才有用
+Sock_TimeOutKick = 0
+
+#和网络安全相关
+[NetSecurity]
+#flood检测
+#Flood攻击检测是否开启,1：开启   0：不开启
+Sock_FloodAttackKickEnable = 1
+#Sock_FloodTimeInterval表示每次收到数据包的时间间隔是100(单位：毫秒)
+Sock_FloodTimeInterval = 100
+#Sock_FloodKickCounter表示计算到连续10次，每次100毫秒时间间隔内发包，就算恶意入侵，把他kick出去
+Sock_FloodKickCounter = 10
+```
+
+这种配置文件依赖于自己的想法设定，没有固定格式，主要还是看如何读取配置文件的各个参数的信息，这才是关键所在。
+
+最终所有的信息都保存到了CConfig:: vector<LPCConfItem> m_ConfigItemList; 存储配置信息的列表。之后我们想取出配置信息就从这个容器中取出即可。
+
+```cpp
+//装载配置文件
+bool CConfig::Load(const char *pconfName) 
+{   
+    FILE *fp;
+    fp = fopen(pconfName,"r");
+    if(fp == NULL)
+        return false;
+
+    //每一行配置文件读出来都放这里
+    char  linebuf[501];   //每行配置都不要太长，保持<500字符内，防止出现问题
+    
+    //走到这里，文件打开成功 
+    while(!feof(fp))  //检查文件是否结束 ，没有结束则条件成立
+    {    
+        
+        if(fgets(linebuf,500,fp) == NULL) //从文件中读数据，每次读一行，一行最多不要超过500个字符 
+            continue;
+
+        if(linebuf[0] == 0)
+            continue;
+
+        //处理注释行
+        if(*linebuf==';' || *linebuf==' ' || *linebuf=='#' || *linebuf=='\t'|| *linebuf=='\n')
+			continue;
+        
+    lblprocstring:
+        //屁股后边若有换行，回车，空格等都截取掉
+		if(strlen(linebuf) > 0)
+		{
+			if(linebuf[strlen(linebuf)-1] == 10 || linebuf[strlen(linebuf)-1] == 13 || linebuf[strlen(linebuf)-1] == 32) 
+			{
+				linebuf[strlen(linebuf)-1] = 0;
+				goto lblprocstring;
+			}		
+		}
+        if(linebuf[0] == 0)
+            continue;
+        if(*linebuf=='[') //[开头的也不处理
+			continue;
+
+        //这种 “ListenPort = 5678”走下来；
+        char *ptmp = strchr(linebuf,'=');
+        if(ptmp != NULL)
+        {
+            /*typedef struct _CConfItem
+            {
+                char ItemName[50];
+                char ItemContent[500];
+            }CConfItem,*LPCConfItem;*/
+            LPCConfItem p_confitem = new CConfItem;                    //注意前边类型带LP，后边new这里的类型不带
+            memset(p_confitem,0,sizeof(CConfItem));
+            strncpy(p_confitem->ItemName,linebuf,(int)(ptmp-linebuf)); //等号左侧的拷贝到p_confitem->ItemName
+            strcpy(p_confitem->ItemContent,ptmp+1);                    //等号右侧的拷贝到p_confitem->ItemContent
+
+            Rtrim(p_confitem->ItemName);
+			Ltrim(p_confitem->ItemName);
+			Rtrim(p_confitem->ItemContent);
+			Ltrim(p_confitem->ItemContent);
+
+            //printf("itemname=%s | itemcontent=%s\n",p_confitem->ItemName,p_confitem->ItemContent);            
+            m_ConfigItemList.push_back(p_confitem);  //内存要释放，因为这里是new出来的 
+        } //end if
+    } //end while(!feof(fp)) 
+
+    fclose(fp); //这步不可忘记
+    return true;
+}
+```
+
+### 设置文件标题
+
+argc:命令行参数的个数
+argv:是个数组，每个数组元素都是指向一个字符串的char *，里边存储的内容是所有命令行参数；
+比如你输入 `./nginx -12 -v 568 -q gess`
+
+argv内存之后，**接着连续的就是环境变量参数信息内存**【是咱们这个可执行程序执行时有关的所有环境变量参数信息】可以通过一个全局的environ[char **]就可以访问
+
+environ内存和argv内存紧紧的挨着
+
+![image-20220310122258634](../images/202231-nginx整体框架解析/image-20220310122258634.png)
+
+为了修改可执行程序的命令行参数，我们必须修改argv参数而且**千万不可以影响到环境变量参数信息**
+实现思路：
+(1)重新分配一块内存，用来保存environ中的内容；
+(2)修改argv[0]所指向的内存；
+
+![image-20220310122315622](../images/202231-nginx整体框架解析/image-20220310122315622.png)
+
+#### ngx_init_setproctitle环境变量拷贝到新内存
+
+```cpp
+//设置可执行程序标题相关函数：分配内存，并且把环境变量拷贝到新内存中来
+void ngx_init_setproctitle()
+{   
+    //这里无需判断penvmen == NULL,有些编译器new会返回NULL，有些会报异常，但不管怎样，如果在重要的地方new失败了，你无法收场，让程序失控崩溃，助你发现问题为好； 
+    gp_envmem = new char[g_envneedmem]; 
+    memset(gp_envmem,0,g_envneedmem);  //内存要清空防止出现问题
+
+    char *ptmp = gp_envmem;
+    //把原来的内存内容搬到新地方来
+    for (int i = 0; environ[i]; i++) 
+    {
+        size_t size = strlen(environ[i])+1 ; //不要拉下+1，否则内存全乱套了，因为strlen是不包括字符串末尾的\0的
+        strcpy(ptmp,environ[i]);      //把原环境变量内容拷贝到新地方【新内存】
+        environ[i] = ptmp;            //然后还要让新环境变量指向这段新内存
+        ptmp += size;
+    }
+    return;
+}
+```
+
+#### ngx_setproctitle设置可执行程序标题
+
+主要思路是：
+
+1. 获取argv[]和environ内存总长度
+2. 将标题title复制到argv起始位置
+3. 将剩下未用上的长度全部清空
+
+```cpp
+//设置可执行程序标题
+void ngx_setproctitle(const char *title)
+{
+    //我们假设，所有的命令 行参数我们都不需要用到了，可以被随意覆盖了；
+    //注意：我们的标题长度，不会长到原始标题和原始环境变量都装不下，否则怕出问题，不处理
+    
+    //(1)计算新标题长度
+    size_t ititlelen = strlen(title); 
+
+    //(2)计算总的原始的argv那块内存的总长度【包括各种参数】    
+    size_t esy = g_argvneedmem + g_envneedmem; //argv和environ内存总和
+    if( esy <= ititlelen)
+    {
+        //你标题多长啊，我argv和environ总和都存不下？注意字符串末尾多了个 \0，所以这块判断是 <=【也就是=都算存不下】
+        return;
+    }
+
+    //空间够保存标题的，够长，存得下，继续走下来    
+
+    //(3)设置后续的命令行参数为空，表示只有argv[]中只有一个元素了，这是好习惯；防止后续argv被滥用，因为很多判断是用argv[] == NULL来做结束标记判断的;
+    g_os_argv[1] = NULL;  
+
+    //(4)把标题弄进来，注意原来的命令行参数都会被覆盖掉，不要再使用这些命令行参数,而且g_os_argv[1]已经被设置为NULL了
+    char *ptmp = g_os_argv[0]; //让ptmp指向g_os_argv所指向的内存
+    strcpy(ptmp,title);
+    ptmp += ititlelen; //跳过标题
+
+    //(5)把剩余的原argv以及environ所占的内存全部清0，否则会出现在ps的cmd列可能还会残余一些没有被覆盖的内容；
+    size_t cha = esy - ititlelen;  //内存总和减去标题字符串长度(不含字符串末尾的\0)，剩余的大小，就是要memset的；
+    memset(ptmp,0,cha);
+    return;
+}
+```
+
+### 日志模块
+
+[日志功能](https://yunf194.github.io/2022/01/29/2022129-%E6%97%A5%E5%BF%97%E5%8A%9F%E8%83%BD/)
 
 ## 测试
 
@@ -2654,7 +3162,7 @@ bool CSocekt::TestFlood(lpngx_connection_t pConn)
 
 限速：epoll技术，一个限速的思路；在epoll红黑树节点中，把这个EPOLLIN【可读】通知干掉；系统不会通知，服务器就不会去读，数据一直积累在接收缓冲区里，客户端那边会的发送缓冲区会满，客户端会减慢速度发送甚至停止发送。
 
-数据报太多的话，会在printTDInfo()中做了一个简单提示，大家根据需要自己改造代码；
+数据报太多的话，会在printTDInfo()中做了一个简单提示
 
 #### 积压太多数据包发送不出去
 
@@ -2808,20 +3316,49 @@ fengyun@ubuntu:~/share/nginx$ telnet 192.168.200.129 80
 
 在ngx_epoll_process_events()加入一个测试代码`ngx_log_stderr(0,"惊群测试:events=%d,进程id=%d",events,ngx_pid); `
 
-可以观察到
+可以观察到尽管只有一个telnet三次握手事件连入，但是四个worker进程都被唤醒了。
 
 ![image-20220217193302164](../images/202231-nginx整体框架解析/image-20220217193302164.png)
 
-官方nginx解决惊群的办法：锁，进程之间的锁；谁获得这个锁，谁就往监听端口增加EPOLLIN标记，有了这个标记，客户端连入就能够被服务器感知到；
+如何解决惊群问题？[深入浅出 Linux 惊群：现象、原因和解决方案](https://zhuanlan.zhihu.com/p/385410196)
+
+官方nginx解决惊群的办法：锁，进程之间的锁；**谁获得这个锁，谁就往监听端口增加EPOLLIN标记，有了这个标记，客户端连入就能够被服务器感知到；**
+
+> Nginx 通过一次仅允许一个进程将 listen fd 放入自己的 epoll 来监听其 READ 事件的方式来达到 listen fd"惊群"避免。然而做好这一点并不容易，作为一个高性能 web 服务器，需要尽量避免阻塞，并且要很好平衡各个工作 worker 的请求，避免饿死情况。
+>
+> Nginx 采用在同一时刻仅允许一个 worker 进程监听 listen fd 的可读事件的方式，来避免 listen fd 的"惊群"现象。然而这种方式编程实现起来比较难，难道不能像 accept 一样解决 epoll 的"惊群"问题么？答案是可以的
+
+首先我采用的是**先 fork 后 epoll_create**（LT模式）
+
+> 用法上，通常是在父进程创建了 listen fd 后，fork 多个 worker 子进程来共同处理同一个 listen fd 上的请求。这个时候，A、B、C...等多个子进程分别创建自己独立的 epoll fd，然后将同一个 listen fd 加入到 epoll 中，监听其可读事件。这种情况下，epoll 有以下这些特性：
+>
+> ```text
+> [1] 由于相对同一个listen fd而言， 多个进程之间的epoll是平等的，于是，listen fd上的一个请求上来，会唤醒所有睡眠在listen fd睡眠队列上的epoll，epoll又唤醒对应的进程task，从而唤醒所有的进程(这里不管listen fd是以LT还是ET模式加入到epoll)。
+> [2] 多个进程间的epoll是独立的，对epoll fd的相关epoll_ctl操作相互独立不影响。
+> ```
+>
+> 可以看出，在使用友好度方面，多进程独立 epoll 实例要比共用 epoll 实例的模式要好很多。独立 epoll 模式要解决 fd 的排他唤醒 epoll 即可。
 
 3.9以上内核版本的linux，在内核中解决了惊群问题；而且性能比官方nginx解决办法效率高很多；
 reuseport【复用端口】,是一种套接字的复用机制，允许将多个套接字bind到同一个ip地址/端口上，这样一来，就可以建立多个服务器来接收到同一个端口的连接【多个worker进程能够监听同一个端口】；
 
+> NGINX 允许配置成获得 Accept 权限的进程一次性循环 Accept 所有同时到达的全部请求，但是，这会造成短时间 worker 进程的负载不均衡。为此，我们希望的是均衡唤醒，也就是，假设有 4 个 worker 进程睡眠在 epoll_wait 上，那么此时同时并发过来 3 个请求，我们希望 3 个 worker 进程被唤醒去处理，而不是仅仅唤醒一个进程或全部唤醒。
+
+> 于是，基本的解决方案是起多个 listen socket，好在我们有 SO_REUSEPORT(linux 3.9 以上内核支持)，它支持多个进程或线程 bind 相同的 ip 和端口，支持以下特性：
+>
+> ```text
+> [1] 允许多个socket bind/listen在相同的IP，相同的TCP/UDP端口
+> [2] 目的是同一个IP、PORT的请求在多个listen socket间负载均衡
+> [3] 安全上，监听相同IP、PORT的socket只能位于同一个用户下
+> ```
+
 但是注意目前master进程中在ngx_open_listening_sockets创建了一个监听套接字，创建了四个worker进程的监听套接字和master套接字是同一个，即使设置了reuseport仍然会产生惊群现象、
 
-[深入浅出 Linux 惊群：现象、原因和解决方案](https://zhuanlan.zhihu.com/p/385410196)在一个 epoll 上睡眠的多个 task，如果在一个 LT 模式下的 fd 的事件上来，会唤醒 epoll 睡眠队列上的所有 task，而 ET 模式下，仅仅唤醒一个 task，这是 epoll"惊群"的根源。
+在一个 epoll 上睡眠的多个 task，如果在一个 LT 模式下的 fd 的事件上来，会唤醒 epoll 睡眠队列上的所有 task，而 ET 模式下，仅仅唤醒一个 task，这是 epoll"惊群"的根源。
 
-看了这位腾讯 IEG 后台开发工程师的文章，我选择了试着在worker进程中使用ngx_open_listening_sockets，每个worker进程都会创建一个监听套接字listenfd，然后使用reuseport
+看了这位腾讯 IEG 后台开发工程师的文章，我选择了试着**在worker进程中使用ngx_open_listening_sockets，每个worker进程都会创建一个监听套接字listenfd，然后使用reuseport。**这样就不再造成惊群了。
+
+![image-20220310112238815](../images/202231-nginx整体框架解析/image-20220310112238815.png)
 
 ## 性能优化
 
@@ -2829,7 +3366,7 @@ reuseport【复用端口】,是一种套接字的复用机制，允许将多个�
 
 软件层面：
 
-1. 充分利用cpu，比如刚才惊群问题；
+1. 充分利用cpu，比如**惊群问题**；
 2. 深入了解tcp/ip协议，通过一些协议参数配置来进一步改善性能；
 3. 处理业务逻辑方面，算法方面有些内容，可以提前做好；
 
@@ -2838,7 +3375,7 @@ reuseport【复用端口】,是一种套接字的复用机制，允许将多个�
 1. 高速网卡，增加网络带宽；
 2. 专业服务器；数十个核心，马力极其强；
 3. 内存：容量大，访问速度快；
-4. 主板啊，总线不断升级的；
+4. 主板，总线不断升级的；
 
 ### 性能优化的实施
 
@@ -2876,7 +3413,7 @@ nvcswch/s：被动切换/秒：时间片耗尽了，你必须要切出去；
 2. 对相关的配置项,记录他的缺省值，做出修改；
 3. 要反复不断的亲自测试，亲自验证；是否提升性能，是否有副作用；
 
-#### CP / IP协议的配置选项
+#### TCP / IP协议的配置选项
 
 1. 绑定cpu、提升进程优先级
 2. TCP / IP协议的配置选项
@@ -2906,6 +3443,6 @@ n:表示我们设置的是文件描述符
 
 ### 内存池补充说明
 
-为什么没有用内存池技术：感觉必要性不大
+为什么没有用内存池技术：感觉必要性不大，等待有时间再补充一下吧。
 TCMalloc,取代malloc();
 库地址：https://github.com/gperftools/gperftools
